@@ -1,0 +1,81 @@
+# cancelli — design
+
+A Rust port of CARE (arXiv 2607.21642, reference impl `prisma-research/CARE` @ `e8166db0c39fa058285b203305649a13eb31fc0b`, MIT) packaged as a Claude Code `PreToolUse` hook.
+
+Research notes: `docs/research/care-paper-report.md`, `docs/research/care-repo-report.md`.
+
+## Decisions (agreed with the user, 2026-09-21)
+
+| # | Decision | Choice |
+|---|----------|--------|
+| D1 | Spec source when paper and repo disagree | **Paper wins.** Repo is the source for concrete rule text, lexicons, path catalogs, weights the paper omits. |
+| D2 | Bugs in the reference | **Port with bugs fixed.** Each fix gets an ID `FIX-NNN`, a README table row, a commit-message line, and a regression test. |
+| D3 | Tool scope | **Bash scored by CARE; all other tools logged raw, unscored.** |
+| D4 | Bash parser | **brush-parser** (replaces bashlex). |
+| D5 | Data | **JSONL, PreToolUse only.** No PostToolUse outcome join. |
+| D6 | Mode | **Dry-run for now** (`--dry-run`): never emits a decision. |
+| D7 | LLM judge on WARN | **Stubbed.** Behind an `Adjudicator` trait; step 2 is a local open-weight model ("Jev"). |
+| D8 | Crate structure | **Library + thin binary.** All logic (pipeline, hook I/O, logging, config) lives in the lib (`src/lib.rs` + modules); `src/main.rs` only parses CLI args and calls into the lib. |
+| D9 | Install | **`cargo install --path .`** → `~/.cargo/bin/cancelli`; the hook command is `cancelli hook --dry-run`. Nothing may depend on the source checkout at runtime (rules/prompt embedded via `include_str!`). |
+| D10 | Config | **`~/.config/cancelli/config.toml`** (`$XDG_CONFIG_HOME/cancelli/config.toml` if set; deliberately *not* macOS `~/Library/Application Support`). |
+
+## Config (D10)
+
+Precedence: CLI flag > env var > config file > built-in default. A missing file means defaults. An unreadable or invalid file means defaults plus an error record in the log (fail open). Unknown keys produce a warning record, not a failure. `cancelli config` prints the effective config and where each value came from. `cancelli config --init` writes a commented default file if none exists.
+
+```toml
+mode = "balanced"          # strict | balanced | auto
+dry_run = true             # the --dry-run flag forces true
+
+[log]
+dir = "~/.local/share/cancelli"   # env CANCELLI_LOG_DIR overrides
+max_field_bytes = 4096            # non-Bash string truncation threshold
+
+[judge]                    # step 2; ignored while the stub is active
+backend = "stub"
+# base_url = "http://127.0.0.1:8006/v1"
+# model = ""
+# timeout_ms = 2000
+```
+
+## Paper-over-repo reconciliations (D1)
+
+| ID | Topic | Repo behaviour | Port behaviour (paper) |
+|----|-------|----------------|------------------------|
+| FIX-001 | `p_rule` skip predicate | raw conf ≥ 0.80 on any rule with a MITRE T-ID (fallback catches GTFOBins/manual) | fires iff a fired rule has tier ∈ {mitre, gtfobins} and π·conf ≥ 0.80 (π = 1.00/0.85/0.60) |
+| FIX-002 | `p_spath` skip predicate | any L3 hit | write to system/critical tier, or any access to secret tier |
+| FIX-003 | `H_sem` high-risk class set | WRITE_SENSITIVE, EXECUTION_CHAIN, PRIVILEGE, PERSISTENCE, DESTRUCTIVE, RESOURCE_ABUSE | destructive, priv-escalate, exec-chaining, persist-modify, network-exfil (map onto repo class enum; document the mapping) |
+| FIX-004 | Judge output parsing | substring DANGEROUS/UNSAFE → DENY, else ALLOW (garbage → ALLOW) | first token ∈ {SAFE, DANGEROUS}; anything else → DENY (fail-closed). Applies to the future real judge; stub never parses. |
+
+## Reference bug fixes (D2)
+
+Numbered continuing from above (FIX-005…), covering at least repo report §9 items 2 (`$()` detection dead under a successful parse), 3 (canonicalization markers polluting L1/L2/L4), 4 (padded base64 not decoded), 7 (no judge timeout — enforce one), and 11 (duplicate/conflicting lexicon entries). Each is verified against the Python reference before being declared a bug.
+
+Not bugs (paper-faithful, kept, observable in dry-run data): everyday dev commands (`rm -rf node_modules`, `git push --force`, `sudo …`) reaching DENY via `p_sem`.
+
+## Implementation defaults (not user-decided; revisit with data)
+
+- **Views.** Canonicalization produces a list of views (raw + each decoded/unwrapped payload) instead of appending marker text. Each layer scores `max` over views (paper: ĉ keeps original tokens).
+- **Multi-command input.** Per simple command ("atom") scoring, `max` over atoms (repo behaviour).
+- **Parse failure.** Mirror repo fallback behaviour; brush-parser's strictness vs bashlex is measured by the parity suite and reported.
+- **macOS paths.** Extension tiers (`~/Library/Keychains`, `/private/etc`, `/System`, `~/Library/LaunchAgents`, …) labeled `EXT-NNN`, listed in README, tagged in log records so they can be filtered out.
+- **All modes logged.** One score, provisional verdicts for strict/balanced/auto all recorded; `balanced` is the configured mode.
+- **Fail open.** Any internal error → log an error record, exit 0, no stdout. A hook must never break the session.
+- **Non-Bash tools.** Log `tool_name` and `tool_input`; string fields > 4 KiB are truncated and accompanied by length + sha256.
+- **Log location.** `$CANCELLI_LOG_DIR` or `~/.local/share/cancelli/`, file `events-YYYY-MM-DD.jsonl` (local date), mode 0600, append with a single `write` per record (O_APPEND) for safety across parallel sessions.
+
+## Hook contract
+
+- stdin: Claude Code PreToolUse JSON (`session_id`, `transcript_path`, `cwd`, `permission_mode`, `hook_event_name`, `tool_name`, `tool_input`, `tool_use_id`, …). Unknown fields ignored; raw payload keys preserved in the log.
+- `--dry-run`: exit 0, empty stdout, always.
+- Enforce mode (built, not registered): DENY → `hookSpecificOutput.permissionDecision = "deny"` with reason; unadjudicated WARN → `"ask"`; ALLOW → no output (normal permission flow, never auto-approve).
+
+## Log record (per PreToolUse)
+
+`ts, version, rules_version, session_id, tool_use_id, cwd, permission_mode, tool_name, mode, dry_run, latency_us` plus, for Bash: `command, views[], layers{L1,L2,L3,L4: score + evidence}, fired_rules[{id, tier, conf, pi, family}], aggregate, provisional{strict,balanced,auto}, skip_predicate, would_adjudicate, judge_prompt (when would_adjudicate), final, fixes_applied[], ext_applied[]`; for others: `tool_input` (truncated per above).
+
+## Testing
+
+- **E2E:** build the binary, pipe real PreToolUse JSON on stdin, assert exit code, empty stdout in dry-run, and exact log-record content (verdicts, fired rules, skip predicate, judge prompt).
+- **Parity:** `scripts/parity/` pins the Python reference at the commit above, runs it over a corpus, and commits golden output. A Rust test compares every record; any divergence must be listed under a `FIX-`/`EXT-` ID or the test fails.
+- **Regression:** one test per `FIX-`/`EXT-` ID demonstrating the corrected behaviour.

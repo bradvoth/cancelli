@@ -1,0 +1,57 @@
+Port CARE to Rust as the `cancelli` PreToolUse hook
+
+cancelli is a Rust port of CARE (Canonicalization, Attribution, and
+Resolution Engine; arXiv:2607.21642, reference impl prisma-research/CARE @
+e8166db, MIT) packaged as a Claude Code PreToolUse hook. It scores Bash
+commands through the full CARE pipeline — canonicalization (as views, not
+marker text) -> L1 structure (brush-parser) / L2 semantic / L3 path / L4
+139-rule pattern bank -> L5 aggregation (0.3/0.3/0.3/0.1) -> per-mode
+provisional verdicts (strict 0.10/0.20, balanced 0.15/0.35, auto 0.20/0.50)
+-> Resolution skip predicates and a stubbed Adjudicator — and logs one JSONL
+record per PreToolUse event. Non-Bash tools are logged raw (truncated +
+sha256 over 4 KiB). Dry-run always exits 0 with empty stdout; enforce mode is
+built but registered by the user.
+
+Structure: library crate with a thin clap binary (D8); `cargo install
+--path .` with the rule bank and judge prompt embedded via include_str! (D9);
+config at $XDG_CONFIG_HOME|~/.config/cancelli/config.toml (D10). The
+brush-parser bash parser replaces bashlex (D4); the WARN-band judge is
+stubbed behind an Adjudicator trait (D7).
+
+Parity: a pinned-reference driver (scripts/parity) generates
+tests/golden/reference.jsonl over a 495-command corpus; a Rust test asserts
+record-by-record parity, and every divergence is attributed to a FIX-/EXT-
+id via tests/golden/allowlist.json (382 identical, 113 attributed). Full unit,
+e2e (real binary + temp log dir) and cargo-install tests; clippy -D warnings
+and fmt clean, no warning suppression.
+
+Verdict shift: no rule the reference fires is ever missed, but because the
+paper's skip predicates (FIX-001..003) are narrower, 24 corpus commands the
+reference DENYs statically now go to the (stubbed) judge instead, and 9 are
+stricter. Enforcement must not be enabled until a real judge replaces the stub.
+
+Deliberate divergences from the reference (each has a regression test and a
+README row):
+
+FIX-001 p_rule uses paper Eq. 9: catalog tiers (mitre, gtfobins), pi*conf >= 0.80.
+FIX-002 p_spath uses paper Eq. 11: write to system/critical tier or any secret access.
+FIX-003 p_sem H_sem uses paper Eq. 10: destructive/priv/exec-chain/persist/network-exfil.
+FIX-004 judge parse is fail-closed: first token SAFE|DANGEROUS, else DENY.
+FIX-005 L1 sees $()/backtick/<() substitutions (dead under bashlex).
+FIX-006 canonicalization produces views instead of polluting layers with marker text.
+FIX-007 padded base64 payloads are decoded (reference regex drops the padding).
+FIX-008 the judge call has a hard timeout and fails closed.
+FIX-009 `git tag` listing is READ_ONLY (reference lexicon conflict).
+FIX-010 L3 treats mkfs.<fs> like mkfs.
+FIX-011 L1 extracts commands from if/for/while/until/case/function bodies.
+FIX-012 brush-parser accepts inputs bashlex rejects ([[ ]], case, $(( )), time).
+FIX-013 pipe-to-interpreter matches the basename of the pipeline tail (| /bin/sh).
+EXT-001 macOS keychain paths are secret-tier.
+EXT-002 macOS /private/{etc,var,tmp} aliases are resolved.
+EXT-003 macOS LaunchAgents/LaunchDaemons/System sensitive-system paths.
+EXT-004 macOS system-root sinks (/System, /Library, /Applications, /Users, /private, /Volumes).
+EXT-005 macOS /dev/diskN and /dev/rdiskN block devices are critical.
+EXT-006 macOS `base64 -D` decode flag triggers payload decoding.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_015U3NJZXHn92Yg7zAHDKRza
