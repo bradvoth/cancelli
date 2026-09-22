@@ -184,6 +184,12 @@ pub fn parse(reader: impl BufRead, current_id: Option<&str>) -> std::io::Result<
             p.bad_lines += 1;
             continue;
         };
+        // Nothing recorded after the current call is context for it. (At
+        // hook time it is normally not written yet; `cancelli eval`
+        // rebuilds states from finished transcripts, D25.)
+        if p.found_current {
+            continue;
+        }
         p.prompts.extend(human_prompts(&rec));
         for t in tool_uses(&rec) {
             if current_id.is_some_and(|c| c == t.id) {
@@ -434,6 +440,17 @@ mod tests {
         .collect::<Vec<_>>()
         .join("\n")
             + "\n{\"type\": \"assistant\", \"message\": {\"con" // torn last line
+    }
+
+    #[test]
+    fn nothing_after_the_current_call_is_context() {
+        // D25 rebuilds states from finished transcripts: the prompt and
+        // call after toolu_2 are not context for it.
+        let p = parse(transcript().as_bytes(), Some("toolu_2")).unwrap();
+        assert!(p.found_current);
+        assert_eq!(p.prompts, vec!["Run the tests"]);
+        assert_eq!(p.prior.len(), 1);
+        assert_eq!(p.bad_lines, 1, "torn lines are still counted");
     }
 
     #[test]

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::jev::client::{self, KeySource, PINNED_MODEL, Secret};
+use crate::jev::client::{self, DEFAULT_EXPECTED_MODEL, KeySource, Secret};
 use crate::policy::Mode;
 use crate::tunables::{self, Tunables};
 
@@ -115,12 +115,16 @@ pub struct Config {
     pub judge_backend: String,
     /// Jev base URL.
     pub judge_base_url: String,
-    /// Requested model (responses must report [`PINNED_MODEL`]).
+    /// Requested model (responses must report `judge.expected_model`,
+    /// a tunable: `tunables.judge.expected_model`).
     pub judge_model: String,
     /// Name of the env var holding the API key.
     pub judge_api_key_env: String,
     /// Key file (0600), used when the env var is unset.
     pub judge_api_key_file: Option<PathBuf>,
+    /// D23: false = a missing key is fine and no `Authorization` header is
+    /// sent (local servers).
+    pub judge_api_key_required: bool,
     /// Per-request timeout in ms.
     pub judge_timeout_ms: u64,
     /// Total budget in ms (including one retry).
@@ -210,11 +214,14 @@ max_field_bytes = 4096            # non-Bash string truncation threshold
 [judge]
 backend = "jev"            # "jev" | "stub"
 base_url = "https://api.typesafe.ai"   # env TYPESAFE_BASE_URL overrides
-model = "jev-1.13.0"       # pinned; response.model must match
+model = "jev-1.13.0"       # requested model (sent in the request body)
+# expected_model = "jev-1.13.0"   # D23: response.model must equal this, else ask (D15); set it for another /v1/systemone server
 api_key_env = "TYPESAFE_API_KEY"
 # api_key_file = "~/.config/cancelli/jev_api_key"   # 0600; used if the env var is unset (this path is the default when the file exists)
+api_key_required = true    # D23: false for local servers: no key needed, no Authorization header when none is found
 timeout_ms = 3000          # per request
 budget_ms = 5000           # total incl. one retry on 408/429/5xx/timeout; keep well under the hook timeout
+# calibration_file = "~/.config/cancelli/calibration.json"   # D24: per-axis calibration, pinned to rubric_hash + expected_model; see `cancelli calibrate`
 "#;
 
 /// The whole file `cancelli config --init` writes: [`DEFAULT_FILE`] plus
@@ -241,8 +248,8 @@ pub fn config_path(env: &Env) -> Option<PathBuf> {
 
 /// `jev_api_key` next to config.toml, used when `api_key_file` is unset and
 /// the file exists.
-fn default_key_file(env: &Env) -> Option<PathBuf> {
-    let p = config_path(env)?.with_file_name("jev_api_key");
+fn default_key_file(config: Option<&Path>) -> Option<PathBuf> {
+    let p = config?.with_file_name("jev_api_key");
     p.exists().then_some(p)
 }
 
@@ -278,14 +285,23 @@ const KNOWN: &[(&str, &[&str])] = &[
             "model",
             "api_key_env",
             "api_key_file",
+            "api_key_required",
             "timeout_ms",
             "budget_ms",
+            "expected_model",
+            "calibration_file",
         ],
     ),
 ];
 
 /// Load the effective configuration.
 pub fn load(env: &Env, cli: &CliOverrides) -> Loaded {
+    load_from(config_path(env), env, cli)
+}
+
+/// [`load`] from an explicit file (`cancelli eval --config`, D25); the
+/// environment and CLI overrides apply exactly as for the hook.
+pub fn load_from(path: Option<PathBuf>, env: &Env, cli: &CliOverrides) -> Loaded {
     let mut diags = Vec::new();
     let mut sources: BTreeMap<&'static str, Source> = BTreeMap::new();
     let mut mode = Mode::Balanced;
@@ -295,7 +311,8 @@ pub fn load(env: &Env, cli: &CliOverrides) -> Loaded {
     let mut decide_all = true;
     let mut backend = "jev".to_string();
     let mut base_url = DEFAULT_BASE_URL.to_string();
-    let mut model = PINNED_MODEL.to_string();
+    let mut model = DEFAULT_EXPECTED_MODEL.to_string();
+    let mut api_key_required = true;
     let mut api_key_env = "TYPESAFE_API_KEY".to_string();
     let mut api_key_file: Option<String> = None;
     let mut timeout_ms: u64 = 3000;
@@ -311,13 +328,13 @@ pub fn load(env: &Env, cli: &CliOverrides) -> Loaded {
         "judge.model",
         "judge.api_key_env",
         "judge.api_key_file",
+        "judge.api_key_required",
         "judge.timeout_ms",
         "judge.budget_ms",
     ] {
         sources.insert(k, Source::Default);
     }
 
-    let path = config_path(env);
     let mut file_found = false;
     let mut root: Option<toml::Table> = None;
     if let Some(p) = &path {
@@ -379,6 +396,10 @@ pub fn load(env: &Env, cli: &CliOverrides) -> Loaded {
                                     api_key_file = Some(v);
                                     sources.insert("judge.api_key_file", Source::File);
                                 }
+                                if let Some(v) = f.api_key_required {
+                                    api_key_required = v;
+                                    sources.insert("judge.api_key_required", Source::File);
+                                }
                                 if let Some(v) = f.timeout_ms {
                                     timeout_ms = v;
                                     sources.insert("judge.timeout_ms", Source::File);
@@ -434,15 +455,6 @@ pub fn load(env: &Env, cli: &CliOverrides) -> Loaded {
         decide_all = true;
         sources.insert("decide_all", Source::Cli);
     }
-    if model != PINNED_MODEL {
-        diags.push(Diagnostic {
-            level: "warning",
-            message: format!(
-                "judge.model {model:?}: the rubric is calibrated for {PINNED_MODEL:?} and any \
-                 other response.model is treated as a failure (ask)"
-            ),
-        });
-    }
     if budget_ms < timeout_ms {
         diags.push(Diagnostic {
             level: "warning",
@@ -471,7 +483,8 @@ pub fn load(env: &Env, cli: &CliOverrides) -> Loaded {
             judge_api_key_env: api_key_env,
             judge_api_key_file: api_key_file
                 .map(|p| expand_tilde(&p, env))
-                .or_else(|| default_key_file(env)),
+                .or_else(|| default_key_file(path.as_deref())),
+            judge_api_key_required: api_key_required,
             judge_timeout_ms: timeout_ms,
             judge_budget_ms: budget_ms,
             tunables: tl.tunables,
@@ -498,6 +511,7 @@ struct FileValues {
     model: Option<String>,
     api_key_env: Option<String>,
     api_key_file: Option<String>,
+    api_key_required: Option<bool>,
     timeout_ms: Option<u64>,
     budget_ms: Option<u64>,
 }
@@ -572,6 +586,12 @@ impl FileValues {
             self.model = table_str(j, "judge", "model")?;
             self.api_key_env = table_str(j, "judge", "api_key_env")?;
             self.api_key_file = table_str(j, "judge", "api_key_file")?;
+            if let Some(v) = j.get("api_key_required") {
+                self.api_key_required = Some(
+                    v.as_bool()
+                        .ok_or("judge.api_key_required must be a boolean")?,
+                );
+            }
             self.timeout_ms = table_ms(j, "judge", "timeout_ms")?;
             self.budget_ms = table_ms(j, "judge", "budget_ms")?;
         }
@@ -682,6 +702,11 @@ pub fn render(l: &Loaded, env: &Env) -> String {
         src("judge.api_key_file")
     ));
     out.push_str(&format!(
+        "judge.api_key_required = {}  # {}\n",
+        c.judge_api_key_required,
+        src("judge.api_key_required")
+    ));
+    out.push_str(&format!(
         "judge.timeout_ms = {}  # {}\n",
         c.judge_timeout_ms,
         src("judge.timeout_ms")
@@ -693,6 +718,9 @@ pub fn render(l: &Loaded, env: &Env) -> String {
     ));
     out.push_str(&match c.api_key(env) {
         Ok((_, from)) => format!("# judge api key: found ({from})\n"),
+        Err(_) if !c.judge_api_key_required => {
+            "# judge api key: none (not required; no Authorization header is sent)\n".into()
+        }
         Err(e) => format!("# judge api key: {e}\n"),
     });
     out.push_str(&tunables::render(&l.tunables_loaded()));

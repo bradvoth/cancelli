@@ -128,6 +128,11 @@ cancelli analyze "<command>" [--mode …]                     # full CARE analys
 cancelli judge "<command>" [--transcript PATH] [--request TEXT] [--decide-all]
                                                             # ask Jev, print the judge record
 cancelli config [--init]                                    # show / write config
+cancelli eval --logs <files…> --config <path> [--offline] [--json]
+                                                            # D25: replay logs under a config
+cancelli calibrate --reference <files…> --out <file> [--offline] [--pairs-out F]
+                   [--model M] [--holdout 0.25] [--seed 42] [--limit N] [--min-pairs 10]
+                                                            # D24: fit a calibration file
 ```
 
 `analyze` prints the complete CARE evidence trace (views, per-layer scores and
@@ -163,12 +168,20 @@ max_field_bytes = 4096            # non-Bash string truncation threshold
 [judge]
 backend = "jev"            # "jev" | "stub"
 base_url = "https://api.typesafe.ai"   # env TYPESAFE_BASE_URL overrides
-model = "jev-1.13.0"       # pinned; response.model must match
+model = "jev-1.13.0"       # requested model (sent in the request body)
+# expected_model = "jev-1.13.0"   # D23: response.model must equal this, else ask (D15); set it for another /v1/systemone server
 api_key_env = "TYPESAFE_API_KEY"
 # api_key_file = "~/.config/cancelli/jev_api_key"   # 0600; used if the env var is unset (this path is the default when the file exists)
+api_key_required = true    # D23: false for local servers: no key needed, no Authorization header when none is found
 timeout_ms = 3000          # per request
 budget_ms = 5000           # total incl. one retry on 408/429/5xx/timeout; keep well under the hook timeout
+# calibration_file = "~/.config/cancelli/calibration.json"   # D24: per-axis calibration, pinned to rubric_hash + expected_model; see `cancelli calibrate`
 ```
+
+`expected_model` and `calibration_file` decide outcomes, so they are
+tunables: validated key by key, part of `config_fingerprint` and listed in
+`overrides[]` (see [Tuning](#tuning)). `api_key_required` and the other
+`[judge]` keys are transport settings (a type error makes the file invalid).
 
 `decide_all` is a **top-level** key: it must sit above the `[log]` table (TOML
 puts anything after a `[table]` header into that table; `log.decide_all` is
@@ -186,7 +199,7 @@ catalogs and regexes stay embedded. The guardrails (D20):
 - **Defaults are today's behaviour.** An empty or absent config changes
   nothing. The parity suite, the Jev fidelity/offline tests and the smoke
   replays run on the defaults, and `tests/golden/tunables_default.json` pins
-  the default values (and their fingerprint, `2654a8f1b09ee5cc`), so any
+  the default values (and their fingerprint, `1ae8acec3c61b1b4`), so any
   drift of a default fails a test.
 - **Validated per key, fail open.** Weights must be finite and ≥ 0.
   Probabilities, scores and thresholds must be in [0, 1], and
@@ -371,6 +384,8 @@ writes the same list as comments):
 | `jev.context.field_chars` | `4000` | clip for args, the user request and each prior call (characters) | POC jev_gate/prepare.py; jev-integration-spec §3.3 |
 | `jev.context.history_chars` | `12000` | history budget for prior calls, newest kept first (characters) | POC jev_gate/prepare.py; jev-integration-spec §3.3 |
 | `jev.context.max_level` | `"L2"` | highest context level: L0 action, L1 +user request, L2 +prior calls | D16; POC jev_gate/context.py |
+| `judge.expected_model` | `"jev-1.13.0"` | response.model the /v1/systemone backend must report; anything else asks (D15) | D23 |
+| `judge.calibration_file` | (none) | per-axis calibration (JSON) pinned to rubric_hash + model; invalid or mismatched asks (fingerprinted by the file's sha256) | D24 |
 | `care.rules."SE-P-NNN".enabled` | `true` | `false` removes the rule from L4 matching and from p_rule | D18 |
 | `care.rules."SE-P-NNN".confidence` | the bank's value | replaces the rule's confidence in L4 (π·conf) and in p_rule | data/rule_provenance.json (care/rules/rule_provenance.json) |
 
@@ -468,14 +483,19 @@ judge `error` record for such a call also carries `tool_name` and
 
 For a WARN that reaches Jev (CARE's, or a D21 unscorable call), `judge` is
 the full Jev record (D17):
-`backend`, `decision`, `level` (`l2_actions` | `l1_request` | `l0_action`),
+`backend`, `backend_host` (D23: `host[:port]` of `judge.base_url`),
+`expected_model` (D23), `decision`, `level` (`l2_actions` | `l1_request` | `l0_action`),
 `context{level_reason, prompts_total, prompts_kept, actions_total,
 bad_lines}`, `questions_sent[]`, `state` (the exact text sent),
-`state_hash`, `rubric_hash`, `model`, `answers`, `signals`, `tier`
-(`T1`…`T6`), `tier_rule`, `verdict`, `would_emit`, `latency_ms`, `usage`,
-`request_id`, `attempts`, `key_source` (e.g. `env $TYPESAFE_API_KEY`, never
-the key), `error`. A Jev failure also writes a separate `error` record with
-`stage: "judge"`.
+`state_hash`, `rubric_hash`, `model` (the backend's reported model),
+`answers` (raw, as reported), `answers_calibrated` and `calibration{file,
+sha, rubric_hash, model, fitted_at, axes[]}` (D24, only with a calibration
+file), `signals` (read from the calibrated answers when there are any),
+`tier` (`T1`…`T6`), `tier_rule`, `verdict`, `would_emit`, `latency_ms`,
+`usage`, `request_id`, `attempts`, `key_source` (e.g. `env
+$TYPESAFE_API_KEY`, or `none (judge.api_key_required = false)`, never the
+key), `error`. A Jev failure also writes a separate `error` record with
+`stage: "judge"` (and `backend_host`).
 
 ### Examining the data
 
@@ -697,8 +717,10 @@ mode:
 Every failure produces **ask** plus an `error` record (`stage: "judge"`), and
 the hook still exits 0. Failures are: no key or a refused key file, a
 connection error, a timeout, a non-2xx response, an unparseable body, a
-missing or wrongly typed answer for any question sent, and
-`response.model != "jev-1.13.0"`. Timing: `timeout_ms` (3,000) per request
+missing or wrongly typed answer for any question sent,
+`response.model != judge.expected_model` (default `"jev-1.13.0"`, D23), and
+a configured calibration file that is unreadable, invalid or pinned to
+another rubric or model (D24). Timing: `timeout_ms` (3,000) per request
 and `budget_ms` (5,000) in total. There is at most **one retry**, only on
 408/429/5xx or a timeout, and only if the wait (`retry-after-ms`, else
 `retry-after` in seconds or as an HTTP-date, else 500 ms) still fits in the
@@ -767,6 +789,195 @@ immediately, with instructions, when `TYPESAFE_API_KEY` is unset. They honour
 It honours `HTTPS_PROXY`/`ALL_PROXY`/`NO_PROXY`. Because it uses bundled
 roots rather than the OS trust store, a TLS-intercepting corporate proxy
 would need its CA added some other way.
+
+## Local backends (D23)
+
+The judge is not tied to TypeSafe's hosted API: `backend = "jev"` means
+**any server that speaks `POST /v1/systemone`** (request `{state, model,
+questions}`, response `{model, answers, usage?}` with `noul` / `score` /
+`choice` answers). The name stays `jev`; there is no alias. The hook never
+runs inference itself (a hook is a fresh process per tool call); the model
+lives in a long-running server such as
+[jev-rs](docs/research/local-jev-serving.md) on top of llama-server.
+
+```toml
+[judge]
+base_url = "http://127.0.0.1:8090"   # the local server
+model = "qwen3-4b-q4"                # requested model (sent in the body)
+expected_model = "qwen3-4b-q4"       # what the server reports as response.model
+api_key_required = false             # no key needed; no Authorization header without one
+timeout_ms = 4500                    # local inference is slower; keep the budget under the hook timeout
+budget_ms = 5000
+calibration_file = "~/.config/cancelli/qwen3-4b.calibration.json"   # D24, below
+```
+
+- `expected_model` (default `"jev-1.13.0"`) replaces the hard-coded pin: a
+  response reporting any other model is a D15 failure (**ask** plus an error
+  record). Set it to exactly what the server reports.
+- `api_key_required = false`: a missing key is fine and no `Authorization`
+  header is sent. A key that *is* found (env var or key file) is still sent.
+- Every judge record logs the backend identity: `backend_host` (`host:port`
+  of `base_url`), `expected_model`, and `model` (the reported one). The
+  judge error record carries `backend_host` too.
+- The tier thresholds were measured on `jev-1.13.0`. With another
+  `expected_model` and no `calibration_file`, `cancelli config` and every
+  hook call log a warning; calibrate (below) and compare with
+  `cancelli eval` before trusting it.
+
+## Calibration (D24)
+
+A local model's probabilities are on its own scale. An optional
+**calibration file** maps them onto Jev's, per axis, so the tier thresholds
+keep their meaning. It is applied after the answers arrive and before the
+signals are read; the judge record logs both `answers` (raw) and
+`answers_calibrated`, plus `calibration{file, sha, rubric_hash, model,
+fitted_at, axes[]}`.
+
+```json
+{
+  "format": "cancelli-calibration/1",
+  "rubric_hash": "0fd1f245ae1c7ef3",
+  "model": "qwen3-4b-q4",
+  "fitted_at": "2026-09-22T12:00:00-04:00",
+  "source": "cancelli 0.1.0 calibrate --reference procreations_v2.jsonl (800 pairs, holdout 0.25, seed 42)",
+  "axes": {
+    "f5_exceeds_approval": {"type": "noul", "method": "platt", "a": 1.31, "b": -0.42, "n": 600,
+                            "metrics": {"n_train": 600, "n_test": 200, "brier_before": 0.061,
+                                        "brier_after": 0.032, "ece_before": 0.118, "ece_after": 0.041}},
+    "a6_destination_class": {"type": "choice", "method": "temperature", "t": 1.8, "n": 600},
+    "b4_reversibility": {"type": "score", "method": "temperature", "t": 0.7, "n": 600}
+  }
+}
+```
+
+- **noul**, `platt`: `p' = σ(a·logit(p) + b)` (p clamped to [1e-6, 1−1e-6]).
+- **choice / score**, `temperature`: `p'_k ∝ max(p_k, 1e-6)^(1/t)`, i.e. a
+  temperature on the log-probabilities, renormalised. A choice's `choice`
+  becomes the new argmax (unchanged by a temperature); a score's `score`
+  becomes `Σ k·p'_k`. A score answer without probabilities cannot be
+  calibrated and fails the call.
+- `method` is a tag, so methods such as isotonic can be added later; an
+  unknown method makes the file invalid. Axes absent from the file are used
+  as reported. `metrics` is informational.
+- **Pinning.** The file is pinned to `rubric_hash` (the rubric in use) and
+  `model` (the backend's *reported* model; it must also equal
+  `expected_model`). An unreadable or invalid file, or a mismatch, refuses
+  calibration: an `error` config record at load, and every judge call fails
+  to **ask** with an error record (D15). Uncalibrated values are never used
+  silently. `calibration_file` is fingerprinted by the file's sha256, so a
+  refit changes `config_fingerprint`.
+
+### `cancelli calibrate`
+
+```sh
+# reference = Jev answers; the target is the configured backend's answers on the same states
+cancelli calibrate --reference ~/Documents/tte/data/runs/procreations_v2.jsonl \
+                   --out ~/.config/cancelli/qwen3-4b.calibration.json \
+                   --pairs-out /tmp/qwen-pairs.jsonl --limit 800
+# refit later without the backend
+cancelli calibrate --offline --reference /tmp/qwen-pairs.jsonl --out cal.json
+```
+
+Each `--reference` line is one of: a **tte run row** (`state_rendered`,
+Jev `answers`, `rubric_hash`, `model`), a **cancelli log record** whose
+`judge` holds a successful `jev-1.13.0` call (`state`, `answers`), or a
+**pair** (`{"id", "rubric_hash", "target_model", "reference": {answers},
+"target": {answers}}`, what `--pairs-out` writes and what `--offline`
+fits on). Rows and records are deduplicated by state; their states are sent
+to the configured backend with exactly the questions Jev answered, and its
+raw (uncalibrated) answers are the target. Rows from another rubric, and
+references that are not `jev-1.13.0`, are skipped and counted. The command
+refuses to run online while `expected_model` is `jev-1.13.0` (calibrating
+Jev against itself would only spend API calls).
+
+Fitting: Platt `(a, b)` minimises the cross-entropy against Jev's `p` as a
+soft target (Newton's method); the temperature minimises `Σ KL(q_jev ‖
+p'_t)` (golden-section search over `1/t`). Items are split once with a
+fixed seed (`--seed 42`) into a fitting set and a held-out set
+(`--holdout 0.25`); parameters are fitted on the first only, and Brier and
+ECE before → after are reported on the held-out items only (Brier: mean
+squared error against Jev's probabilities, summed over labels for
+choice/score; ECE: 10 equal-width bins over every predicted probability,
+`|mean p − mean q_jev|` weighted by bin size). Axes with fewer than
+`--min-pairs` (10) fitting pairs are reported and left out of the file.
+
+## Eval: replaying logs under another config (D25)
+
+```sh
+cancelli eval --logs ~/.local/share/cancelli/events-*.jsonl --config /tmp/candidate.toml [--offline] [--json]
+```
+
+Every logged `event` is turned back into its `PreToolUse` payload and run
+through the hook's own decision function (`hook::evaluate_call`: the same
+CARE, D21, judge, decision and record code as the hook, nothing
+duplicated), under the given config (environment overrides such as
+`CANCELLI_MODE` apply as they would to the hook). Nothing is logged.
+
+- **CARE** is replayed exactly, from the logged `command`.
+- **Judge.** When the would-be state and the rubric are unchanged and the
+  effective backend (`base_url` host + `expected_model`) is the one the
+  record was judged with, the **logged answers are reused** and evaluated
+  under the new config (calibration, thresholds, tier order, verdicts).
+  Otherwise the configured backend is queried: the **logged state is
+  resent** when the record has one; a call that **newly reaches** the judge
+  (e.g. a CARE deny that is now a WARN) gets its state **rebuilt** from the
+  record's `transcript_path` and `tool_use_id` if the transcript still
+  exists (only what precedes that call counts), else it is reported as
+  "needs judge (no state)". `--offline` never queries (and never reads the
+  API key) and reports these as "needs judge". Records written before D23
+  carry no `backend_host`; they count as judged by `api.typesafe.ai` with
+  `jev-1.13.0`. A `jev.context` override on either side counts as a changed
+  state. Logged answers come back in label order, so an exact argmax tie
+  between two choice labels may resolve differently than on the wire.
+- **Non-Bash** calls replay per D21 and `skip_tools`. Logged `tool_input`
+  strings over `max_field_bytes` are truncated, so the logged judge state is
+  preferred; with neither, the call is reported as "input truncated".
+- **Older records** get a best-effort old decision, noted in `why`: no
+  `final` on a non-Bash record = `none` (pre-D21 or `skip_tools`
+  pass-through), stub-era `unadjudicated` = `ask` (what enforce mode
+  emitted). Non-event lines (errors, warnings) are skipped and counted.
+
+The compared decision is `final` (`allow` / `ask` / `deny`), `none` when
+there is none, or `needs judge`; `decide_all` only changes whether an allow
+is emitted (`would_emit`, in the JSON). Output: a summary, the old → new
+transition matrix, and the changed calls sorted by time with the reasons
+(CARE mode/verdict/score/skip predicate/rule changes, newly or no longer
+judged, tier changes, calibration, where the answers came from). `--json`
+prints one object per replayed record, then a `{"summary": …}` line.
+
+Sample (this repository's own dry-run log of 2026-09-22, `--offline`, a
+candidate config that removes `DESTRUCTIVE` from `care.resolution.h_sem`
+and keeps the `skip_tools` those records were logged with; long lines
+cut):
+
+```
+cancelli eval: config /tmp/eval-cfg2/config.toml (config_fingerprint 429676c71cbebef7; overrides ["care.resolution.h_sem", "jev.skip_tools"])
+records: 697 lines, replayed 692, skipped 5, changed 19
+  skipped 5: not an event (kind=error)
+  14: needs judge (offline; no logged state)
+  4: needs judge (offline; the logged judge call failed (no Jev API key: …))
+  1: needs judge (offline; the logged judge call failed (timeout (global) (after retry)))
+
+transition matrix (rows old, columns new)
+old \ new          allow         ask        deny        none needs judge
+allow                490           0           0           0           0
+ask                    0          33           0           0           9
+deny                   0           0           7           0           7
+none                   0           0           0         143           3
+
+changed calls (19)
+ts                  tool          command / target                                  old → new             why
+2026-09-22T09:08:34 Bash          T=$(mktemp -d); HOME=$T XDG_CONFIG_HOME=$T/cfg …  deny → needs judge    skip p_sem:DESTRUCTIVE→none; newly reaches the judge; needs judge (offline; no logged state)
+2026-09-22T09:08:48 Bash          T=$(mktemp -d); HOME=$T XDG_CONFIG_HOME=$T/cfg …  deny → needs judge    skip p_sem:DESTRUCTIVE→none; newly reaches the judge; needs judge (offline; no logged state)
+2026-09-22T09:54:53 WebSearch     TypeSafe AI RLCD "Reinforcement Learning for Ca…  ask → needs judge     needs judge (offline; the logged judge call failed (timeout (global) (after retry)))
+…
+```
+
+The seven `rm -rf` temp-dir denials that relied only on `p_sem:DESTRUCTIVE`
+become WARNs that need the judge; two other `p_sem:DESTRUCTIVE` denials stay
+denied because their score is at or above τ_high. Without `--offline`, those
+seven would be rebuilt from the session transcript and sent to the
+configured backend.
 
 ## Divergences from the reference
 

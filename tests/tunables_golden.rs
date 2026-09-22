@@ -40,7 +40,8 @@ fn readme_tunable_table_lists_every_key_with_its_default() {
             .lines()
             .find(|l| l.starts_with(&format!("| `{}` |", k.key)))
             .unwrap_or_else(|| panic!("README has no row for {}", k.key));
-        if k.key != "jev.rubric_file" {
+        // Files are fingerprinted by content; their rows name the default.
+        if k.key != "jev.rubric_file" && k.key != "judge.calibration_file" {
             let v = cancelli::tunables::toml_value(&canon[k.key]);
             assert!(row.contains(&format!("| `{v}` |")), "{}: {row}", k.key);
         }

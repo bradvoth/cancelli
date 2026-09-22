@@ -1,5 +1,7 @@
 //! Tunables (D18–D20): the numeric knobs of CARE (`[care]`) and of the Jev
-//! adjudicator (`[jev]`) in `config.toml`.
+//! adjudicator (`[jev]`) in `config.toml`, plus the decision-relevant
+//! backend identity of `[judge]` (D23 `expected_model`, D24
+//! `calibration_file`).
 //!
 //! * [`Tunables::default`] reproduces the built-in constants exactly, so an
 //!   empty or absent config changes nothing (the parity and Jev fidelity
@@ -25,7 +27,8 @@ use toml::{Table, Value as TV};
 
 use crate::config::{Diagnostic, Env, expand_tilde};
 use crate::jev::A6;
-use crate::jev::client::PINNED_MODEL;
+use crate::jev::calibration::{self, Calibration};
+use crate::jev::client::DEFAULT_EXPECTED_MODEL;
 use crate::jev::decide::{TIERS, TierId, Verdict as JevVerdict, unavailable_tiers};
 use crate::jev::rubric::{self, EXPECTED_RUBRIC_HASH, Rubric};
 use crate::jev::state::{Level, MAX_FIELD_CHARS, MAX_PRIOR_CHARS};
@@ -416,6 +419,56 @@ impl JevTunables {
     }
 }
 
+// ----------------------------------------------------------------- judge --
+
+/// State of `judge.calibration_file` (D24).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum CalibrationState {
+    /// No file configured: answers are used as reported.
+    #[default]
+    None,
+    /// A valid file.
+    Loaded(Arc<Calibration>),
+    /// Configured but unreadable or invalid: every judge call fails to
+    /// `ask` with this error (never silently uncalibrated).
+    Invalid {
+        /// Configured path.
+        path: PathBuf,
+        /// Why.
+        error: String,
+    },
+}
+
+/// Decision-relevant `[judge]` keys (D23, D24).
+#[derive(Debug, Clone, PartialEq)]
+pub struct JudgeTunables {
+    /// D23: the `response.model` a backend must report (else D15 ask).
+    pub expected_model: String,
+    /// D24: the calibration applied to the backend's answers.
+    pub calibration: CalibrationState,
+}
+
+impl Default for JudgeTunables {
+    fn default() -> Self {
+        JudgeTunables {
+            expected_model: DEFAULT_EXPECTED_MODEL.to_string(),
+            calibration: CalibrationState::None,
+        }
+    }
+}
+
+impl JudgeTunables {
+    /// Fingerprint value of `judge.calibration_file`: `"none"`, the file's
+    /// sha (content, not path), or `"invalid"`.
+    pub fn calibration_id(&self) -> String {
+        match &self.calibration {
+            CalibrationState::None => "none".into(),
+            CalibrationState::Loaded(c) => format!("sha256:{}", c.sha),
+            CalibrationState::Invalid { .. } => "invalid".into(),
+        }
+    }
+}
+
 // ----------------------------------------------------------------- whole --
 
 /// Every tunable.
@@ -425,6 +478,8 @@ pub struct Tunables {
     pub care: CareTunables,
     /// `[jev]`.
     pub jev: JevTunables,
+    /// `[judge]` expected_model and calibration_file.
+    pub judge: JudgeTunables,
 }
 
 /// Documentation of one tunable key (`config --init`, README).
@@ -745,6 +800,16 @@ pub const KNOBS: &[Knob] = &[
         doc: "highest context level: L0 action, L1 +user request, L2 +prior calls",
         source: "D16; POC jev_gate/context.py",
     },
+    Knob {
+        key: "judge.expected_model",
+        doc: "response.model the /v1/systemone backend must report; anything else asks (D15)",
+        source: "D23",
+    },
+    Knob {
+        key: "judge.calibration_file",
+        doc: "per-axis calibration (JSON) pinned to rubric_hash + model; invalid or mismatched asks",
+        source: "D24",
+    },
 ];
 
 /// Dotted key of a per-rule field.
@@ -848,6 +913,14 @@ impl Tunables {
         v.push((
             "jev.context.max_level".into(),
             json!(j.context.max_level.short()),
+        ));
+        v.push((
+            "judge.expected_model".into(),
+            json!(self.judge.expected_model),
+        ));
+        v.push((
+            "judge.calibration_file".into(),
+            json!(self.judge.calibration_id()),
         ));
         for (id, o) in &c.rules {
             if !o.enabled {
@@ -1407,9 +1480,9 @@ fn load_jev(t: &Table, rd: &mut Rd<'_>, env: &Env) -> JevTunables {
                             path.display(),
                             r.hash
                         ));
-                        if r.model != PINNED_MODEL {
+                        if r.model != DEFAULT_EXPECTED_MODEL {
                             rd.warn(format!(
-                                "{key}: rubric model {:?} is not {PINNED_MODEL:?}",
+                                "{key}: rubric model {:?} is not {DEFAULT_EXPECTED_MODEL:?}",
                                 r.model
                             ));
                         }
@@ -1453,8 +1526,79 @@ pub fn rubric_warnings(j: &JevTunables) -> Vec<String> {
     out
 }
 
-/// Read the `care` and `jev` tables of a parsed config file (None: no file,
-/// or not valid TOML). Every value is validated on its own.
+/// `[judge]` expected_model and calibration_file (the other `[judge]` keys
+/// are transport settings read by `config`, which also reports unknown
+/// keys). The calibration is validated against the rubric in use.
+fn load_judge(t: &Table, rd: &mut Rd<'_>, env: &Env, jev: &JevTunables) -> JudgeTunables {
+    let mut j = JudgeTunables::default();
+    if let Some(v) = t.get("expected_model") {
+        let key = "judge.expected_model";
+        match v.as_str().filter(|s| !s.is_empty() && s.trim() == *s) {
+            Some(s) => {
+                j.expected_model = s.to_string();
+                rd.set.insert(key.into());
+            }
+            None => rd.error(
+                key,
+                format!("{v} is not a non-empty model name without surrounding spaces"),
+            ),
+        }
+    }
+    if let Some(v) = t.get("calibration_file") {
+        let key = "judge.calibration_file";
+        match v.as_str() {
+            None => rd.error(key, format!("{v} is not a string")),
+            Some(s) => {
+                let path = expand_tilde(s, env);
+                rd.set.insert(key.into());
+                let loaded = effective_rubric(jev)
+                    .and_then(|r| calibration::load(&path, &r))
+                    .and_then(|c| {
+                        if c.file.model == j.expected_model {
+                            Ok(c)
+                        } else {
+                            Err(format!(
+                                "it is pinned to model {:?} but judge.expected_model is {:?}",
+                                c.file.model, j.expected_model
+                            ))
+                        }
+                    });
+                j.calibration = match loaded {
+                    Ok(c) => CalibrationState::Loaded(Arc::new(c)),
+                    Err(e) => {
+                        rd.diags.push(Diagnostic {
+                            level: "error",
+                            message: format!(
+                                "{key}: {} refused ({e}); every judge call will ask (D24, D15)",
+                                path.display()
+                            ),
+                        });
+                        CalibrationState::Invalid { path, error: e }
+                    }
+                };
+            }
+        }
+    }
+    if j.expected_model != DEFAULT_EXPECTED_MODEL && j.calibration == CalibrationState::None {
+        rd.warn(format!(
+            "judge.expected_model {:?}: the jev tier thresholds were calibrated on \
+             {DEFAULT_EXPECTED_MODEL:?}; consider judge.calibration_file (D24)",
+            j.expected_model
+        ));
+    }
+    j
+}
+
+fn effective_rubric(j: &JevTunables) -> Result<Rubric, String> {
+    match &j.rubric {
+        Some(r) => Ok((**r).clone()),
+        None => rubric::rubric().cloned(),
+    }
+}
+
+/// Read the `care`, `jev` and (decision-relevant) `judge` tables of a
+/// parsed config file (None: no file, or not valid TOML). Every value is
+/// validated on its own.
 pub fn load(root: Option<&Table>, env: &Env, diags: &mut Vec<Diagnostic>) -> Loaded {
     let mut rd = Rd {
         diags,
@@ -1467,6 +1611,10 @@ pub fn load(root: Option<&Table>, env: &Env, diags: &mut Vec<Diagnostic>) -> Loa
         }
         if let Some(j) = rd.table(root, "", "jev") {
             t.jev = load_jev(j, &mut rd, env);
+        }
+        // `[judge]` not being a table is reported by `config`.
+        if let Some(TV::Table(j)) = root.get("judge") {
+            t.judge = load_judge(j, &mut rd, env, &t.jev);
         }
     }
     for w in rubric_warnings(&t.jev) {
@@ -1504,7 +1652,24 @@ pub fn render(l: &Loaded) -> String {
         if k.starts_with("care.rules.") {
             continue;
         }
-        let shown = if k == "jev.rubric_file" {
+        let shown = if k == "judge.calibration_file" {
+            match &t.judge.calibration {
+                CalibrationState::None => "(none)".to_string(),
+                CalibrationState::Loaded(c) => format!(
+                    "{:?}  # sha256 {}, model {:?}, rubric_hash {}, fitted_at {}, {} axes",
+                    c.path.display().to_string(),
+                    c.sha,
+                    c.file.model,
+                    c.file.rubric_hash,
+                    c.file.fitted_at,
+                    c.file.axes.len()
+                ),
+                CalibrationState::Invalid { path, error } => format!(
+                    "{:?}  # INVALID ({error}): every judge call asks",
+                    path.display().to_string()
+                ),
+            }
+        } else if k == "jev.rubric_file" {
             match &t.jev.rubric_file {
                 Some(p) => format!(
                     "{:?}  # rubric_hash {}",
@@ -1556,7 +1721,8 @@ pub fn init_template() -> String {
          ## ProCreations corpus (FINDINGS §5); recalibrate before trusting changes.\n",
     );
     let mut current = String::new();
-    for k in KNOBS {
+    // `[judge]` keys live in the [judge] table of `config::DEFAULT_FILE`.
+    for k in KNOBS.iter().filter(|k| !k.key.starts_with("judge.")) {
         let (table, leaf) = table_of(k.key);
         if table != current {
             out.push_str(&format!("\n# [{table}]\n"));

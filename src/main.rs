@@ -80,6 +80,53 @@ enum Cmd {
         #[arg(long)]
         init: bool,
     },
+    /// D25: replay logged tool calls under a config and report which
+    /// decisions change.
+    Eval {
+        /// cancelli log files (events-*.jsonl).
+        #[arg(long, num_args = 1.., required = true)]
+        logs: Vec<std::path::PathBuf>,
+        /// The config.toml to evaluate.
+        #[arg(long)]
+        config: std::path::PathBuf,
+        /// Never query a judge backend; report such calls as "needs judge".
+        #[arg(long)]
+        offline: bool,
+        /// One JSON object per record, then a summary object.
+        #[arg(long)]
+        json: bool,
+    },
+    /// D24: fit a calibration file for the configured /v1/systemone backend
+    /// against Jev's answers.
+    Calibrate {
+        /// Reference data: pair files, tte runs JSONL, or cancelli logs.
+        #[arg(long, num_args = 1.., required = true)]
+        reference: Vec<std::path::PathBuf>,
+        /// Calibration file to write (JSON).
+        #[arg(long)]
+        out: std::path::PathBuf,
+        /// Never query the backend: fit on pair lines only.
+        #[arg(long)]
+        offline: bool,
+        /// Also write the pairs used (JSONL), for refitting with --offline.
+        #[arg(long)]
+        pairs_out: Option<std::path::PathBuf>,
+        /// Model to pin (default: the backend's reported model).
+        #[arg(long)]
+        model: Option<String>,
+        /// Held-out fraction for the before/after metrics.
+        #[arg(long, default_value_t = 0.25)]
+        holdout: f64,
+        /// Seed of the fixed split.
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
+        /// Use at most this many reference items.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Fewest fitting pairs for an axis to be calibrated.
+        #[arg(long, default_value_t = 10)]
+        min_pairs: usize,
+    },
 }
 
 fn main() -> ExitCode {
@@ -194,6 +241,64 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             } else {
                 ExitCode::SUCCESS
+            }
+        }
+        Cmd::Eval {
+            logs,
+            config,
+            offline,
+            json,
+        } => {
+            let env = Env::from_process();
+            let args = cancelli::eval::EvalArgs {
+                logs,
+                config,
+                offline,
+            };
+            match cancelli::eval::run(&args, &env) {
+                Ok(r) => {
+                    if json {
+                        print!("{}", cancelli::eval::render_json(&r));
+                    } else {
+                        print!("{}", cancelli::eval::render_text(&r));
+                    }
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("cancelli: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+        Cmd::Calibrate {
+            reference,
+            out,
+            offline,
+            pairs_out,
+            model,
+            holdout,
+            seed,
+            limit,
+            min_pairs,
+        } => {
+            let env = Env::from_process();
+            let mut args = cancelli::calibrate::CalibrateArgs::new(reference, out);
+            args.offline = offline;
+            args.pairs_out = pairs_out;
+            args.model = model;
+            args.holdout = holdout;
+            args.seed = seed;
+            args.limit = limit;
+            args.min_pairs = min_pairs;
+            match cancelli::calibrate::run(&args, &env) {
+                Ok(o) => {
+                    print!("{}", cancelli::calibrate::render(&o, &args.out));
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("cancelli: {e}");
+                    ExitCode::FAILURE
+                }
             }
         }
         Cmd::Config { init } => {

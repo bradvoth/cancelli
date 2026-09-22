@@ -27,6 +27,10 @@ Research notes: `docs/research/care-paper-report.md`, `docs/research/care-repo-r
 | D20 | Tunable guardrails | Every default equals today's behaviour, so an empty config changes nothing, and the parity and fidelity tests run on defaults. Values are validated at load; an invalid value falls back to its default with an error record (fail open). Each log record carries `config_fingerprint`, a hash of the effective tunables, plus `overrides[]`, the keys that differ from default. `cancelli config` lists every tunable with its source. |
 | D21 | Unscorable calls → Jev (2026-09-22) | **Supersedes D3's "logged raw, unscored" for decision purposes.** Any tool call CARE cannot score counts as a WARN and goes to Jev (D12's trigger extended), and Jev's tier decides allow/ask/deny (D14, D15, D13 all apply). That means every non-Bash tool, plus a Bash call with a missing or empty `command`. The proposed action renders as the POC's `Name(json)` with the input verbatim, clipped as in D16. `[jev] skip_tools` (default **empty**) lists tool names exempted from Jev; those keep the old pass-through. Raw logging of the input (truncated + sha256) stays as before. |
 | D22 | cancelli decides everything (2026-09-22) | **`decide_all` defaults to true and also covers CARE ALLOW.** CARE ALLOW → `allow`, CARE DENY → `deny`, CARE WARN → Jev, and Jev allow/ask/deny are emitted as-is. Target permission mode: `default` or `acceptEdits` instead of `auto`, switched in the same step as leaving dry-run. `decide_all = false` restores the silent pass-through (the auto-mode profile). `skip_tools` calls still emit nothing. |
+| D23 | Local Jev alternatives (2026-09-22) | The Jev backend is generalized to **any `/v1/systemone`-compatible server** (e.g. jev-rs, Kev, Open-Jev servers). New `[judge]` keys: `expected_model` (default `jev-1.13.0`; replaces the hard-coded pin), `api_key_required` (default true; local servers may set false), per-backend `timeout_ms`/`budget_ms`. No inference inside the hook. Research: `docs/research/local-jev-models.md`, `docs/research/local-jev-serving.md`. |
+| D24 | Calibration | **Optional, in cancelli.** A per-axis calibration file (Platt/temperature per question and answer type) referenced by `[judge] calibration_file`. It is pinned to rubric_hash and the backend's reported model; a mismatch is refused with an error record and D15 applies. It is fitted by a cancelli command against paired Jev answers (cancelli logs and the tte runs), so Jev's tier thresholds keep their meaning. |
+| D25 | Eval = log replay | `cancelli eval --logs <files> --config <path>` re-runs logged tool calls under the given config and reports which decisions change (old → new, with reasons; `--json`). CARE is replayed exactly. Jev reuses logged answers when the state and rubric are unchanged. The backend is queried when the backend differs or a call newly reaches Jev: the logged state is resent, or a new one is rebuilt from the record's transcript. `--offline` skips judge calls and reports them as needing the judge. |
+| D26 | First local trial | **jev-rs + Qwen ~4B GGUF on the installed llama-server**, evaluated with D25 against the logged Jev answers. |
 | D8 | Crate structure | **Library + thin binary.** All logic (pipeline, hook I/O, logging, config) lives in the lib (`src/lib.rs` + modules); `src/main.rs` only parses CLI args and calls into the lib. |
 | D9 | Install | **`cargo install --path .`** → `~/.cargo/bin/cancelli`; the hook command is `cancelli hook --dry-run`. Nothing may depend on the source checkout at runtime (rules/prompt embedded via `include_str!`). |
 | D10 | Config | **`~/.config/cancelli/config.toml`** (`$XDG_CONFIG_HOME/cancelli/config.toml` if set; deliberately *not* macOS `~/Library/Application Support`). |
@@ -47,11 +51,14 @@ max_field_bytes = 4096            # non-Bash string truncation threshold
 [judge]
 backend = "jev"            # "jev" | "stub"
 base_url = "https://api.typesafe.ai"   # env TYPESAFE_BASE_URL overrides
-model = "jev-1.13.0"       # pinned; response.model must match
+model = "jev-1.13.0"       # requested model
+expected_model = "jev-1.13.0"   # D23: response.model must match (tunable, fingerprinted)
 api_key_env = "TYPESAFE_API_KEY"
 # api_key_file = "~/.config/cancelli/jev_api_key"   # 0600; used if the env var is unset
+api_key_required = true    # D23: false = no key needed, no Authorization header without one
 timeout_ms = 3000          # per request
 budget_ms = 5000           # total incl. one retry on 408/429/5xx; must stay well under the hook timeout
+# calibration_file = "..." # D24: per-axis calibration JSON pinned to rubric_hash + model (tunable, fingerprinted by content)
 ```
 
 The key is never written to logs or to config.toml. When `api_key_file` has group or other permissions, it is refused with an error record, and the D15 behaviour applies.
@@ -90,7 +97,7 @@ Not bugs (paper-faithful, kept, observable in dry-run data): everyday dev comman
 
 ## Log record (per PreToolUse)
 
-`ts, version, rules_version, session_id, tool_use_id, cwd, permission_mode, tool_name, mode, dry_run, latency_us` plus, for Bash: `command, views[], layers{L1,L2,L3,L4: score + evidence}, fired_rules[{id, tier, conf, pi, family}], aggregate, provisional{strict,balanced,auto}, skip_predicate, would_adjudicate, judge_prompt (when would_adjudicate), final, fixes_applied[], ext_applied[]`; for others: `tool_input` (truncated per above), plus (D21, unless in `jev.skip_tools`) `care{supported:false, reason}`, `unscored: true`, `provisional: "WARN"`, `would_adjudicate`, `judge`, `final`, `would_emit`, `fixes_applied[]`. Every record also carries `config_fingerprint`, `overrides[]` and `rubric_hash` (D20).
+`ts, version, rules_version, session_id, tool_use_id, cwd, permission_mode, tool_name, mode, dry_run, latency_us` plus, for Bash: `command, views[], layers{L1,L2,L3,L4: score + evidence}, fired_rules[{id, tier, conf, pi, family}], aggregate, provisional{strict,balanced,auto}, skip_predicate, would_adjudicate, judge_prompt (when would_adjudicate), final, fixes_applied[], ext_applied[]`; for others: `tool_input` (truncated per above), plus (D21, unless in `jev.skip_tools`) `care{supported:false, reason}`, `unscored: true`, `provisional: "WARN"`, `would_adjudicate`, `judge`, `final`, `would_emit`, `fixes_applied[]`. Every record also carries `config_fingerprint`, `overrides[]` and `rubric_hash` (D20). A `judge` record also carries `backend_host`, `expected_model` and the reported `model` (D23), and with a calibration file `answers_calibrated` and `calibration{file, sha, rubric_hash, model, fitted_at, axes}` next to the raw `answers` (D24).
 
 ## Testing
 

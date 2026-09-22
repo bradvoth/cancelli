@@ -99,3 +99,31 @@ Constraints: no commit; don't touch ~/Documents/tte, ~/.config/cancelli, ~/.clau
 - Record for unscored: tool_input(raw) + care{supported:false,reason} + unscored:true + provisional:"WARN" + would_adjudicate + would_emit + judge + final + fixes_applied. Reasons: "non-shell tool" | "missing command" | "empty command" | "command is not a string".
 - U4 done: jev_e2e +5 D21 tests (harness generalised: Setup::tool, transcript_with, extra_config); e2e bash_without_command_fails_open -> bash_without_command_goes_to_jev; non_bash_tools_are_logged_raw +D21 asserts; tunables unit skip_tools test; golden regenerated -> fingerprint 2654a8f1b09ee5cc
 - U5 done: README (intro, What it does, Register latency/cost, Jev scope, egress, mapping, skip_tools prose+row+example, inventory row, log schema, jq example, enforce table, limitations), DESIGN log-record line, COMMIT_MSG rewritten. FINAL: 146 offline tests pass (lib 85, docs 2, e2e 18, jev_e2e 17, jev_offline 4, parity 1, tunables_golden 2, tuning_e2e 17), 3 ignored not run; clippy --all-targets --all-features -D warnings + fmt clean; not committed.
+
+---
+# D23 any systemone server / D24 calibration / D25 eval — started 2026-09-22
+
+Constraints: no commit; tte read-only; never touch ~/.config/cancelli, ~/.claude/settings.json; ~/.local/share/cancelli read-only (eval test only); no paid API / #[ignore] tests; temp HOME/XDG/CANCELLI_LOG_DIR in tests; Edit/Write tools, no heredocs; don't bind ports 8080-8099 (tests bind 127.0.0.1:0); another agent installs jev-rs/llama-server — leave alone.
+
+## Design (decided here)
+- backend name stays "jev" (no alias); it means "any /v1/systemone server".
+- [judge] expected_model (default "jev-1.13.0") + calibration_file are TUNABLES (Tunables.judge, fingerprinted, KNOBS, golden); api_key_required (default true) is transport config (config.rs, like timeout_ms). Default fingerprint changes (new keys) -> golden regenerated deliberately.
+- calibration file = JSON `{"format":"cancelli-calibration/1", rubric_hash, model, fitted_at, source, axes:{id:{type, method:"platt"{a,b}|"temperature"{t}, n, metrics?}}}`; invalid/unreadable -> CalState::Invalid -> every judge call errors -> ask (D15) + error record; mismatch rubric_hash/model checked per call.
+- apply: noul p' = σ(a·logit(clamp p)+b); choice/score p' ∝ max(p,1e-6)^(1/t), score' = Σ k·p'_k, choice' = argmax. After check_complete, before signals. Record: answers (raw), answers_calibrated, calibration{file_sha,rubric_hash,model,fitted_at}.
+- judge record adds backend_host, expected_model (model = reported).
+- jev::judge_action split: prepare (ctx+state) / fetch (HTTP) / evaluate (model check, completeness, calibration, signals, tier) so eval reuses evaluate.
+- hook::run split: `hook::evaluate_call(payload, loaded, env, &factory) -> Evaluated {records, decision}` (no writing); hook writes; eval discards.
+- eval decision compared = `final` (allow/ask/deny; unadjudicated->ask; no final -> none) + "needs judge" state.
+
+## Milestones
+- [x] E0 plan (this)
+- [x] E1 D23 config/tunables/client/record (default fingerprint now 1ae8acec3c61b1b4, golden regenerated)
+- [x] E2 D24 src/jev/calibration.rs + apply in jev::evaluate + error paths
+- [x] E3 D24 src/calibrate.rs + `cancelli calibrate`
+- [x] E4 hook refactor: hook::evaluate_call (no writes) + run writes; pre-existing tests unchanged & green
+- [x] E5 D25 src/eval.rs (ReplayJudge) + `cancelli eval`
+- [x] E6 tests: tests/support/mod.rs, tests/local_backend.rs (8), tests/eval_e2e.rs (5) green
+- [x] E7 README (Local backends / Calibration / Eval sections, judge.* rows, CLI, log schema, D15), tunables_golden exception for calibration_file, COMMIT_MSG rewritten, DESIGN config block + log-record line, clippy -D warnings + fmt clean
+- FINAL: 169 offline tests pass (lib 94, docs 2, e2e 19, eval_e2e 5, jev_e2e 17, jev_offline 4, local_backend 8, parity 1, tunables_golden 2, tuning_e2e 17), 3 ignored not run; default fingerprint 1ae8acec3c61b1b4; not committed.
+- Real-log eval (read-only, --offline): h_sem w/o DESTRUCTIVE -> 7 rm -rf p_sem:DESTRUCTIVE denials become needs judge (2 stay deny: score >= tau_high). Control config (defaults + inferred skip_tools): 79 reused Jev answers reproduce every logged tier; CARE identical; only 12 records with no usable answers change.
+- Note: transcript::parse now ignores records after the current tool_use (eval rebuilds from finished transcripts); bad_lines still counted.

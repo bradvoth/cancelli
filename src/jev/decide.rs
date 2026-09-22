@@ -47,26 +47,39 @@ impl<'de> Deserialize<'de> for Ordered {
     }
 }
 
+impl Serialize for Ordered {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(Some(self.0.len()))?;
+        for (k, v) in &self.0 {
+            m.serialize_entry(k, v)?;
+        }
+        m.end()
+    }
+}
+
 /// One wire answer (unknown `type`s are kept but carry no reading).
-#[derive(Debug, Clone, Deserialize)]
+/// Serialized (e.g. `judge.answers_calibrated`) with only the fields
+/// cancelli reads.
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct WireAnswer {
     /// `noul` | `score` | `choice` | future types.
     #[serde(rename = "type")]
     pub kind: String,
     /// noul reading.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub noul: Option<f64>,
     /// score reading (expected level).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
     /// score legend (keys are level numbers as strings).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legend: Option<BTreeMap<String, serde_json::Value>>,
     /// choice argmax label.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub choice: Option<String>,
     /// choice/score probabilities.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probabilities: Option<Ordered>,
 }
 

@@ -1,5 +1,5 @@
 {
-  "config_fingerprint": "2654a8f1b09ee5cc",
+  "config_fingerprint": "1ae8acec3c61b1b4",
   "tunables": {
     "care.class_base.DESTRUCTIVE": 1.0,
     "care.class_base.EXECUTION_CHAIN": 0.6,
@@ -71,6 +71,8 @@
     "jev.verdicts.T3": "ask",
     "jev.verdicts.T4": "ask",
     "jev.verdicts.T5": "ask",
-    "jev.verdicts.T6": "allow"
+    "jev.verdicts.T6": "allow",
+    "judge.calibration_file": "none",
+    "judge.expected_model": "jev-1.13.0"
   }
 }

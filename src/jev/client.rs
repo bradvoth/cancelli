@@ -9,15 +9,28 @@
 //! * The key is read from the env var named by `api_key_env`, else from
 //!   `api_key_file` (refused if group/other have any permission). It is held
 //!   in [`Secret`] (redacted `Debug`), never logged, and scrubbed from every
-//!   error string by [`redact`].
+//!   error string by [`redact`]. D23: with `api_key_required = false` a
+//!   missing key is fine and no `Authorization` header is sent; a key that
+//!   is present is still sent.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use super::decide::WireResponse;
 
-/// Model the rubric was calibrated against (D15).
-pub const PINNED_MODEL: &str = "jev-1.13.0";
+/// The model the rubric and the tier thresholds were calibrated against
+/// (D15), and the default of `judge.expected_model` (D23).
+pub const DEFAULT_EXPECTED_MODEL: &str = "jev-1.13.0";
+
+/// `host[:port]` of a base URL (scheme, userinfo, path and query dropped),
+/// logged as the backend identity (D23). Never contains credentials.
+pub fn host_of(base_url: &str) -> String {
+    let rest = base_url.split_once("://").map_or(base_url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    host.to_ascii_lowercase()
+}
+
 /// Response header carrying the request id.
 pub const REQUEST_ID_HEADER: &str = "x-typesafe-request-id";
 /// Backoff when a retryable response carries no hint.
@@ -178,16 +191,18 @@ pub fn retry_after(
     })
 }
 
-fn attempt(url: &str, key: &Secret, body: &str, timeout: Duration) -> Attempt {
+fn attempt(url: &str, key: Option<&Secret>, body: &str, timeout: Duration) -> Attempt {
     let agent: ureq::Agent = ureq::Agent::config_builder()
         .timeout_global(Some(timeout))
         .http_status_as_error(false)
         .user_agent(format!("cancelli/{}", crate::VERSION))
         .build()
         .into();
-    let res = agent
-        .post(url)
-        .header("Authorization", &format!("Bearer {}", key.expose()))
+    let mut req = agent.post(url);
+    if let Some(k) = key {
+        req = req.header("Authorization", &format!("Bearer {}", k.expose()));
+    }
+    let res = req
         .header("Accept", "application/json")
         .header("Content-Type", "application/json")
         .send(body);
@@ -229,13 +244,14 @@ fn snippet(s: &str) -> String {
 }
 
 /// POST the body; parse and return the response. Never exceeds the budget
-/// (plus connection-setup slack inside ureq's own timeout).
-pub fn post(t: &Transport, key: &Secret, body: &str) -> Result<Reply, Failure> {
+/// (plus connection-setup slack inside ureq's own timeout). `key = None`
+/// sends no `Authorization` header (D23, `api_key_required = false`).
+pub fn post(t: &Transport, key: Option<&Secret>, body: &str) -> Result<Reply, Failure> {
     let start = Instant::now();
     let url = format!("{}/v1/systemone", t.base_url.trim_end_matches('/'));
     let mut attempts = 0u32;
     let fail = |error: String, request_id: Option<String>, attempts: u32| Failure {
-        error: redact(&error, Some(key)),
+        error: redact(&error, key),
         request_id,
         attempts,
     };
@@ -370,6 +386,17 @@ mod tests {
         );
         assert_eq!(retry_after(None, Some("soon"), now), None);
         assert_eq!(retry_after(None, None, now), None);
+    }
+
+    #[test]
+    fn host_of_drops_scheme_userinfo_and_path() {
+        assert_eq!(host_of("https://api.typesafe.ai"), "api.typesafe.ai");
+        assert_eq!(host_of("http://127.0.0.1:8123/"), "127.0.0.1:8123");
+        assert_eq!(
+            host_of("http://user:secret@Local.Host:9/v1?x=1"),
+            "local.host:9"
+        );
+        assert_eq!(host_of("localhost:7"), "localhost:7");
     }
 
     #[test]

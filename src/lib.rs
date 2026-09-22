@@ -5,9 +5,11 @@
 //! All logic lives in this library (D8); `src/main.rs` only parses CLI
 //! arguments.
 
+pub mod calibrate;
 pub mod canon;
 pub mod config;
 pub mod engine;
+pub mod eval;
 pub mod fixes;
 pub mod hook;
 pub mod jev;

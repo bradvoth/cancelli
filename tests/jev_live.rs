@@ -12,7 +12,7 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use cancelli::jev::client::{self, PINNED_MODEL, Secret, Transport};
+use cancelli::jev::client::{self, DEFAULT_EXPECTED_MODEL, Secret, Transport};
 use cancelli::jev::decide::{self, Answers};
 use cancelli::jev::rubric::{Primitive, rubric};
 use serde_json::{Value, json};
@@ -54,14 +54,21 @@ fn live_smoke_gate() {
     let ask = |s: &common::smoke::Side| -> Answers {
         let st = state(s);
         let caps = st.level.capabilities();
-        let body = cancelli::jev::request_body(&st.render(), PINNED_MODEL, r.questions_json(caps));
-        let reply = client::post(&t, &key, &body).unwrap_or_else(|f| {
+        let body = cancelli::jev::request_body(
+            &st.render(),
+            DEFAULT_EXPECTED_MODEL,
+            r.questions_json(caps),
+        );
+        let reply = client::post(&t, Some(&key), &body).unwrap_or_else(|f| {
             panic!(
                 "API call failed: {} (request_id {:?})",
                 f.error, f.request_id
             )
         });
-        assert_eq!(reply.response.model, PINNED_MODEL, "response.model");
+        assert_eq!(
+            reply.response.model, DEFAULT_EXPECTED_MODEL,
+            "response.model"
+        );
         decide::check_complete(r, caps, &reply.response.answers).unwrap();
         eprintln!(
             "  {} request_id={:?} usage={:?}",
@@ -194,7 +201,7 @@ fn live_warn_command_end_to_end_through_installed_binary() {
     eprintln!("{}", serde_json::to_string_pretty(j).unwrap());
     assert_eq!(j["backend"], "jev");
     assert_eq!(j["error"], Value::Null);
-    assert_eq!(j["model"], PINNED_MODEL);
+    assert_eq!(j["model"], DEFAULT_EXPECTED_MODEL);
     assert_eq!(
         j["level"], "l2_actions",
         "transcript read, current tool_use found"
