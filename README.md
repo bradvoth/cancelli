@@ -206,7 +206,7 @@ jq -r 'select(.kind=="event") | (.fixes_applied + .ext_applied)[]' \
 jq -r 'select(.judge.backend=="jev") | [.ts,.judge.tier,.judge.verdict,.judge.level,.judge.latency_ms,.command] | @tsv' \
   ~/.local/share/cancelli/events-*.jsonl
 
-# how often the transcript lagged the hook (L1/L0 instead of L2)
+# context level Jev actually got, and why
 jq -r 'select(.judge.backend=="jev") | .judge.context.level_reason' \
   ~/.local/share/cancelli/events-*.jsonl | sort | uniq -c
 ```
@@ -576,9 +576,11 @@ Kept minimal; each earns its place:
   π·conf (0.85 × 0.90 = 0.765) falls just under θrule, so they now depend on
   Jev's verdict, or ask if Jev fails. No L4 rule the reference fires is ever
   missed.
-- **Transcript lag is unmeasured.** If Claude Code has not yet written the
-  current `tool_use` to the transcript when the hook runs, Jev gets L1
-  instead of L2. Check `judge.context.level_reason` in the dry-run logs.
+- **Transcript lag.** Measured on a live session: PreToolUse fires *before*
+  Claude Code writes the current `tool_use`, so every call already in the
+  transcript is treated as prior (L2). Calls made immediately before this one
+  may also still be unwritten and so missing from the prior actions. Check
+  `judge.context.level_reason` / `actions_total` in the logs.
 - **Bash-only scoring** (D3). Writes to `~/.zshrc` via the `Write` tool, a
   persistence vector, are logged but not scored — CARE never sees them.
 - **Stateless** (matching the paper): no cross-turn correlation, so staged

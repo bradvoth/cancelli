@@ -12,9 +12,10 @@
 //!   (`tool_use_id`), rendered `Name(json)` like the POC's `_call_text`;
 //!   `Bash` calls render as `bash(<command>)` like the smoke gate. Tool
 //!   results, assistant text and thinking are never read (reasoning-blind).
-//! * **Level**: no or unreadable transcript -> L0; the current `tool_use` not
-//!   yet in the transcript (it lags the hook) -> L1, or L0 without a prompt;
-//!   otherwise L2. The achieved level and why are recorded.
+//! * **Level**: no or unreadable transcript -> L0. PreToolUse fires before
+//!   the current `tool_use` is written, so when it is absent every recorded
+//!   call counts as prior. Prior actions present -> L2; none -> L1, or L0
+//!   without a prompt. The achieved level and why are recorded.
 
 use std::io::BufRead;
 use std::path::{Path, PathBuf};
@@ -289,16 +290,20 @@ pub fn build(src: &ContextSource) -> Context {
     if let Some(p) = parsed {
         c.bad_lines = p.bad_lines;
         prompts = p.prompts;
-        let lagging = src.tool_use_id.is_some() && !p.found_current;
-        if lagging {
-            c.level = Level::L1;
-            c.level_reason = "current tool_use not yet in transcript".into();
+        // PreToolUse fires before Claude Code writes the current tool_use, so
+        // it is normally absent; every recorded call then precedes it.
+        c.level_reason = if src.tool_use_id.is_some() && !p.found_current {
+            "transcript (current tool_use not yet written; all recorded calls are prior)".into()
         } else {
-            c.level = Level::L2;
-            c.level_reason = "transcript".into();
-            c.actions_total = p.prior.len();
-            c.prior_actions = p.prior.iter().map(prior_call_text).collect();
-        }
+            "transcript".into()
+        };
+        c.actions_total = p.prior.len();
+        c.prior_actions = p.prior.iter().map(prior_call_text).collect();
+        c.level = if c.prior_actions.is_empty() {
+            Level::L1
+        } else {
+            Level::L2
+        };
     }
     if let Some(r) = &src.request_override {
         prompts = vec![r.clone()];
@@ -443,11 +448,16 @@ mod tests {
         assert_eq!(c.level, Level::L2);
         assert_eq!(c.prior_actions.len(), 2);
         assert_eq!(c.user_request, "Run the tests\n\nnow clean the build dir");
-        // lagging: current tool use not written yet
+        // current tool use not written yet (the normal PreToolUse case):
+        // every recorded call is prior
         let c = ctx(Some("toolu_9"), Some(path.clone()));
+        assert_eq!(c.level, Level::L2);
+        assert_eq!(c.prior_actions.len(), 3);
+        assert!(c.level_reason.contains("not yet written"));
+        // first call of a session: no prior actions -> L1 (f6 not asked)
+        let c = ctx(Some("toolu_1"), Some(path.clone()));
         assert_eq!(c.level, Level::L1);
         assert!(c.prior_actions.is_empty());
-        assert_eq!(c.level_reason, "current tool_use not yet in transcript");
         // missing transcript
         let c = ctx(Some("toolu_3"), Some(dir.path().join("nope.jsonl")));
         assert_eq!(c.level, Level::L0);
