@@ -445,9 +445,68 @@ pub fn state_from_shell_command_with(
     }
 }
 
+/// D21: the state for a tool call CARE cannot score (any non-`Bash` tool, or
+/// a `Bash` call without a usable command). The POC's non-shell adapter
+/// form: `tool = <Name>` verbatim, `args = clip(args_text(input))`, i.e. the
+/// two halves of its `Name(json)` call text ([`call_text_with`]), with
+/// decodes taken from the unclipped args text. Prior turns and limits are
+/// exactly as for a shell command.
+pub fn state_from_tool_call_with(
+    name: &str,
+    input: &Value,
+    user_request: &str,
+    prior_actions: &[String],
+    level: Level,
+    limits: &ContextLimits,
+) -> State {
+    let text = args_text(input);
+    State {
+        tool: name.to_string(),
+        args: clip(&text, limits.field_chars),
+        user_request: clip(user_request, limits.field_chars),
+        prior_turns: prior_actions
+            .iter()
+            .map(|c| PriorTurn {
+                call_text: c.clone(),
+                result_text: String::new(),
+            })
+            .collect(),
+        decoded: decode_payloads(&text),
+        level,
+        history_chars: limits.history_chars,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_call_state_is_the_name_json_call_text_split() {
+        let input = serde_json::json!({"file_path": "/w/a.rs", "content": "fn main() {}\n"});
+        let lim = ContextLimits::default();
+        let st = state_from_tool_call_with("Write", &input, "", &[], Level::L0, &lim);
+        assert_eq!(
+            format!("{}({})", st.tool, st.args),
+            call_text_with("Write", &input, lim.field_chars)
+        );
+        assert_eq!(
+            st.render(),
+            "### PROPOSED ACTION\ntool: Write\n\
+             args: {\"content\": \"fn main() {}\\n\", \"file_path\": \"/w/a.rs\"}"
+        );
+        // clipped per jev.context.field_chars, like prior calls
+        let lim = ContextLimits {
+            field_chars: 10,
+            ..lim
+        };
+        let st = state_from_tool_call_with("Write", &input, "", &[], Level::L0, &lim);
+        assert!(st.args.starts_with("{\"content\"\n[... truncated, "));
+        assert_eq!(
+            format!("{}({})", st.tool, st.args),
+            call_text_with("Write", &input, 10)
+        );
+    }
 
     #[test]
     fn clip_counts_code_points() {

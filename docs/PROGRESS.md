@@ -82,3 +82,20 @@ Constraints: no commit; don't touch ~/Documents/tte, credentials, ~/.claude/sett
 - T5 done: tests/tuning_e2e.rs (17, real binary, temp HOME+XDG_CONFIG_HOME, fixture server), tests/tunables_golden.rs (1; golden tests/golden/tunables_default.json, fingerprint e1b0fc1e6d5d91ad), +4 tunables unit, +2 decide, +1 transcript, +1 state. Pre-existing test files untouched (git diff tests/ empty). clippy -D warnings + fmt clean.
 - T6 done: README "Tuning" (table generated from `config --init`, checked by tests/tunables_golden.rs), constant inventory + not-exposed table, examples, calibration-from-logs, caution; COMMIT_MSG rewritten for this change (all FIX/EXT/JEV-DEV ids kept for docs_consistency); DESIGN log-record line mentions the new fields.
 - FINAL: 140 offline tests pass (lib 83, docs 2, e2e 18, jev_e2e 12, jev_offline 4, parity 1, tunables_golden 2, tuning_e2e 17); clippy --all-targets -D warnings + fmt clean; not committed.
+
+---
+# D21 unscorable calls -> Jev — started 2026-09-22
+
+Constraints: no commit; don't touch ~/Documents/tte, ~/.config/cancelli, ~/.claude/settings.json; no network; no #[ignore] live tests; tests use temp HOME/XDG_CONFIG_HOME/CANCELLI_LOG_DIR.
+
+## Milestones
+- [x] U0 read D21 + code (hook/engine/resolution/jev state)
+- [x] U1 skip_tools tunable (validate, inventory, --init, fingerprint, golden)
+- [x] U2 generalise Jev proposed action (Name(json)), Bash bytes unchanged
+- [x] U3 hook: non-Bash + missing-command Bash -> WARN -> Jev; logging fields
+- [x] U4 tests (jev_e2e D21 set, e2e expectation updates)
+- [x] U5 README, COMMIT_MSG, clippy/fmt, full run
+- U1-U3 code done: jev::Action {Shell, Tool}, JudgeInput{action, prompt: Option}, state::state_from_tool_call_with (tool=Name, args=clip(args_text(input)), decodes from unclipped), hook scored/unscored match, JevTunables.skip_tools (+ skips()), unscored_decision_output, log_judge_error(unscored adds tool_name+unscored).
+- Record for unscored: tool_input(raw) + care{supported:false,reason} + unscored:true + provisional:"WARN" + would_adjudicate + would_emit + judge + final + fixes_applied. Reasons: "non-shell tool" | "missing command" | "empty command" | "command is not a string".
+- U4 done: jev_e2e +5 D21 tests (harness generalised: Setup::tool, transcript_with, extra_config); e2e bash_without_command_fails_open -> bash_without_command_goes_to_jev; non_bash_tools_are_logged_raw +D21 asserts; tunables unit skip_tools test; golden regenerated -> fingerprint 2654a8f1b09ee5cc
+- U5 done: README (intro, What it does, Register latency/cost, Jev scope, egress, mapping, skip_tools prose+row+example, inventory row, log schema, jq example, enforce table, limitations), DESIGN log-record line, COMMIT_MSG rewritten. FINAL: 146 offline tests pass (lib 85, docs 2, e2e 18, jev_e2e 17, jev_offline 4, parity 1, tunables_golden 2, tuning_e2e 17), 3 ignored not run; clippy --all-targets --all-features -D warnings + fmt clean; not committed.

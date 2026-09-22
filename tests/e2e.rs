@@ -225,6 +225,10 @@ fn non_bash_tools_are_logged_raw() {
     assert_eq!(rec["tool_input"]["content"], "fn main() {}");
     assert!(rec.get("command").is_none());
     assert!(rec.get("aggregate").is_none());
+    // D21: unscored, so judged (no key here: ask, D15)
+    assert_eq!(rec["care"]["reason"], "non-shell tool");
+    assert_eq!(rec["judge"]["verdict"], "ask");
+    assert_eq!(rec["final"], "ask");
 }
 
 #[test]
@@ -277,15 +281,29 @@ fn empty_stdin_fails_open() {
     );
 }
 
+// Expectation changed by D21: a Bash call without a command used to be a
+// `bash_input` error record; it is now unscorable, so it is a WARN for Jev
+// (here with no key: ask plus a judge error record, D15).
 #[test]
-fn bash_without_command_fails_open() {
+fn bash_without_command_goes_to_jev() {
     let r = run(
         &["hook", "--dry-run"],
         &payload("Bash", serde_json::json!({"description": "x"})),
     );
     assert_eq!(r.code, 0);
-    let rec = r.records.iter().find(|r| r["kind"] == "error").unwrap();
-    assert_eq!(rec["stage"], "bash_input");
+    assert_eq!(r.stdout, "");
+    assert!(!r.records.iter().any(|r| r["stage"] == "bash_input"));
+    let rec = r.records.iter().find(|r| r["kind"] == "event").unwrap();
+    assert_eq!(rec["care"]["supported"], false);
+    assert_eq!(rec["care"]["reason"], "missing command");
+    assert_eq!(rec["provisional"], "WARN");
+    assert_eq!(rec["unscored"], true);
+    assert_eq!(rec["tool_input"]["description"], "x");
+    assert_eq!(rec["judge"]["backend"], "jev");
+    assert_eq!(rec["final"], "ask");
+    let er = r.records.iter().find(|r| r["kind"] == "error").unwrap();
+    assert_eq!(er["stage"], "judge");
+    assert_eq!(er["tool_name"], "Bash");
 }
 
 #[test]

@@ -1,76 +1,76 @@
-Expose CARE and Jev tunables in config.toml (D18-D20)
+Send tool calls CARE cannot score to Jev as WARNs (D21)
 
-Every numeric knob of CARE and of the Jev adjudicator can now be set in
-config.toml. Lexicons, path catalogs and regexes stay embedded. The
-defaults reproduce the previous constants exactly, so an empty or absent
-config changes nothing.
+Until now every non-Bash tool call (Write, Edit, Read, WebFetch, mcp__...)
+was logged raw and never decided (D3), and a Bash call without a command
+was an error record. D21 treats any call CARE cannot score as a WARN: it
+goes to the Jev adjudicator, and Jev's tier decides allow / ask / deny
+exactly as for a Bash WARN. The D14 tier map, D15 failure -> ask and D13
+decide_all all apply. Enforce mode emits the same deny/ask JSON (allow
+only with decide_all), and dry-run calls Jev for real, logs, and emits
+nothing (D17).
 
-[care] (D18): L5 weights; tau_low/tau_high for each mode; theta_rule,
-theta_sem and the H_sem class set; provenance pi per tier; the 10 L2 class
-base scores; the 5 L1 ladder values; the 8 L3 tier scores. Per-rule
-overrides by SE-P id: `enabled = false` removes a rule from L4 matching and
-from p_rule, and `confidence` feeds both L4 (pi*conf) and p_rule.
+"Cannot score" means every tool whose name is not `Bash`, plus a `Bash`
+call whose tool_input.command is missing, not a string, or empty or
+whitespace.
 
-[jev] (D19): the tier thresholds (a5 transport, a1/a7 sensitive, a6
-unknown and its f5 gate, f5 deny/ask, d1 obfuscated, b4 irreversible),
-the first-match tier order, the T1..T6 -> allow|ask|deny map, and the
-context limits (4,000-char clip, 12,000-char history budget, max level
-L0/L1/L2). `rubric_file` loads an alternative rubric YAML with the same
-parser and lint as the embedded one. Its rubric_hash is logged and is the
-hash in the judge record. An unreadable or invalid file falls back to the
-embedded rubric with an error record. A tier that reads an axis the rubric
-lacks can never fire, and each one produces a warning record.
+Proposed action: the POC's non-shell `Name(json)` form. The state carries
+`tool: <tool_name>` verbatim and `args: <json.dumps(input, sort_keys=True,
+ensure_ascii=False)>`, clipped at jev.context.field_chars, with decodes
+from the unclipped args. This is the same text as the call's prior-action
+rendering (`call_text_with`), split into its two halves. The state builder
+now takes a `jev::Action` (Shell | Tool). The Shell path is the unchanged
+`state_from_shell_command_with`, so Bash states and state_hashes are
+byte-identical, and the fidelity, smoke and parity tests pass untouched.
+The prior-actions context and transcript handling (D16) are unchanged, and
+the current tool_use is excluded from the priors as for Bash.
+`resolution::JudgeInput` now carries the action and an optional CARE
+prompt, which an unscored call has none of.
 
-Guardrails (D20): values are validated one at a time. Weights must be
-finite and >= 0, probabilities and thresholds in [0,1], tau_low < tau_high,
-and class names, tier names and SE-P ids must be known. An invalid value
-falls back to its own default with an error record naming the key, and
-unknown keys produce warnings. The hook still fails open. Every log record
-now carries `config_fingerprint`, a 16-hex sha256 of the canonical JSON of
-the effective tunables (independent of key order and spelling), plus
-`overrides[]` (the dotted keys that differ from the default) and
-`rubric_hash`. `cancelli config` lists every tunable with its value and
-source, and the effective enabled/confidence of all 139 rules.
-`cancelli config --init` appends every tunable at its default, each with a
-one-line explanation and its provenance (paper eq., repo file or FINDINGS
-section), all commented out.
+`[jev] skip_tools` (default []) lists tool names, matched exactly, that
+keep the old pass-through: logged raw, no judge, no decision. It must be
+an array of non-empty strings. It is sorted and deduplicated, then
+fingerprinted, and an invalid value falls back to [] with an error record.
+Listing "Bash" warns, because it only exempts Bash calls with no command.
+Adding the key changes the default config_fingerprint from
+e1b0fc1e6d5d91ad to 2654a8f1b09ee5cc (tests/golden/tunables_default.json
+regenerated). It is in `config`, `config --init` and the README table.
 
-The values are threaded through the engine and Jev as a `Tunables` struct
-(src/tunables.rs; `Options.care`, `jev::Settings.tuning`), not globals.
-Tier predicate text in the judge record (`tier_rule`) shows the thresholds
-in force.
+Log records for unscored calls keep `tool_input` (truncated + sha256) and
+add `care: {"supported": false, "reason": "non-shell tool" | "missing
+command" | "empty command" | "command is not a string"}`, `unscored: true`,
+`provisional: "WARN"` (a plain string: there is no per-mode score),
+`would_adjudicate`, `judge` (same schema as for Bash), `final`,
+`would_emit` and `fixes_applied`. A judge failure also writes the usual
+`stage: "judge"` error record, which here names the tool and carries
+`unscored: true`. Bash records are unchanged.
 
-Tests: the parity suite, the Jev fidelity/offline tests, the smoke replays
-and every pre-existing e2e test pass unchanged on defaults. A golden
-snapshot (tests/golden/tunables_default.json, fingerprint e1b0fc1e6d5d91ad)
-pins Tunables::default(). tests/tuning_e2e.rs drives the real binary with a
-temp HOME and XDG_CONFIG_HOME and shows that each group changes the
-outcome:
-- lowering balanced tau_high turns the rsync WARN into DENY;
-- disabling SE-P-103 drops it from fired_rules and gives ALLOW;
-- raising gtfobins pi makes p_rule fire on a GTFOBins shell;
-- mapping T5 to deny changes the enforce output from ask to deny on the
-  replayed POC fixture;
-- a smaller history budget, a field clip and max_level change the rendered
-  state;
-- a rubric_file with a renamed axis warns, and T2/T5 never fire.
-It also checks that invalid values fall back per key with an error record,
-exit 0 and silent dry-run. The fingerprint is stable across layouts, and
-overrides[] lists exactly the changed keys. `config --init` pins nothing,
-and uncommenting it reproduces the defaults. The README table is checked
-against the code.
+Cost and egress: every non-skipped non-Bash call is now one Jev round
+trip (POC p50 ~226 ms, capped by budget_ms) and one metered request. Its
+full input, including Write/Edit file bodies up to the clip and Read
+paths, is sent to api.typesafe.ai. The README covers this in "What it
+does", "Register as a hook", "Data egress", the mapping, the log schema,
+the enforce table and "Known limitations".
 
-Docs: README "Tuning" (all tunables with default, meaning and provenance;
-examples; calibrating from logs by fingerprint and overrides; a caution
-that the Jev thresholds were calibrated on the embedded rubric and on the
-ProCreations corpus) and a constant inventory listing what stays embedded
-and why.
+Tests: tests/jev_e2e.rs drives the real binary against the replayed POC
+fixtures. Write, Read, WebFetch and mcp__server__tool each produce a judge
+record whose logged and sent state is the `Name(json)` form, with the
+current call excluded from the priors. In enforce mode, T2 gives deny, T5
+gives ask, T6 is silent, and T6 with decide_all gives allow. A Bash call
+with a missing, empty, whitespace or non-string command goes to Jev, not
+to an error record. skip_tools = ["Read"] passes Read through with no
+request, while Write is still judged. No key or an unreachable server
+gives ask plus an error record, silent in dry-run. Unit tests cover the
+tool-call state and skip_tools validation and fingerprinting. Changed
+expectations: e2e `bash_without_command_fails_open` becomes
+`bash_without_command_goes_to_jev`, and `non_bash_tools_are_logged_raw`
+also asserts the judge record.
 
 Unchanged: FIX-001, FIX-002, FIX-003, FIX-004, FIX-005, FIX-006, FIX-007,
-FIX-008, FIX-009, FIX-010, FIX-011, FIX-012, FIX-013, EXT-001, EXT-002,
-EXT-003, EXT-004, EXT-005, EXT-006, and the Jev deviations JEV-DEV-001,
-JEV-DEV-002, JEV-DEV-003, JEV-DEV-004 (the budget JEV-DEV-002 describes is
-now `jev.context.history_chars`).
+FIX-008 (also bounds the unscored judge call), FIX-009, FIX-010, FIX-011,
+FIX-012, FIX-013, EXT-001, EXT-002, EXT-003, EXT-004, EXT-005, EXT-006,
+and the Jev deviations JEV-DEV-001, JEV-DEV-002, JEV-DEV-003 and
+JEV-DEV-004 (JEV-DEV-004's "every unresolved WARN is a fresh call" now
+includes unscored calls).
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_015U3NJZXHn92Yg7zAHDKRza

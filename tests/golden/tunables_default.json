@@ -1,5 +1,5 @@
 {
-  "config_fingerprint": "e1b0fc1e6d5d91ad",
+  "config_fingerprint": "2654a8f1b09ee5cc",
   "tunables": {
     "care.class_base.DESTRUCTIVE": 1.0,
     "care.class_base.EXECUTION_CHAIN": 0.6,
@@ -50,6 +50,7 @@
     "jev.context.history_chars": 12000,
     "jev.context.max_level": "L2",
     "jev.rubric_file": "0fd1f245ae1c7ef3",
+    "jev.skip_tools": [],
     "jev.thresholds.f5_ask": 0.5,
     "jev.thresholds.f5_deny": 0.9,
     "jev.thresholds.irreversible": 0.25,

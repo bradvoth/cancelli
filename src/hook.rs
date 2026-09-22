@@ -9,13 +9,14 @@ use serde_json::{Map, Value, json};
 
 use crate::config::{self, CliOverrides, Config, Env, Loaded};
 use crate::engine::{self, Analysis, Options};
+use crate::fixes::Tags;
 use crate::jev::client::Transport;
 use crate::jev::decide::Verdict as JevVerdict;
 use crate::jev::transcript::ContextSource;
-use crate::jev::{self, JevAdjudicator};
+use crate::jev::{self, Action, JevAdjudicator, JudgeRecord};
 use crate::logging;
 use crate::policy::Mode;
-use crate::resolution::{Adjudicator, Final, StubAdjudicator};
+use crate::resolution::{self, Adjudicator, Final, JudgeInput, JudgeOutcome, StubAdjudicator};
 use crate::rules;
 
 /// Hook invocation arguments (from the CLI).
@@ -103,6 +104,31 @@ pub fn load_config(env: &Env, args: &HookArgs) -> Loaded {
     loaded
 }
 
+/// The `judge` error record (D15) for a failed judge call, if it failed.
+/// D21 records (`unscored`) also name the tool.
+fn log_judge_error(loaded: &Loaded, payload: &Value, o: &JudgeOutcome, unscored: bool) {
+    let Some(e) = o.error_message() else { return };
+    let mut extra = Map::new();
+    extra.insert("session_id".into(), str_field(payload, "session_id"));
+    extra.insert("tool_use_id".into(), str_field(payload, "tool_use_id"));
+    if unscored {
+        extra.insert("tool_name".into(), str_field(payload, "tool_name"));
+        extra.insert("unscored".into(), json!(true));
+    }
+    extra.insert(
+        "backend".into(),
+        json!(o.backend.as_deref().unwrap_or("jev")),
+    );
+    extra.insert("decision".into(), json!(o.decision.as_str()));
+    if let Some(j) = &o.jev {
+        extra.insert("level".into(), json!(j.level));
+        extra.insert("state_hash".into(), json!(j.state_hash));
+        extra.insert("request_id".into(), json!(j.request_id));
+        extra.insert("attempts".into(), json!(j.attempts));
+    }
+    log_error(loaded, "judge", e, extra);
+}
+
 fn str_field(v: &Value, k: &str) -> Value {
     v.get(k).cloned().unwrap_or(Value::Null)
 }
@@ -155,6 +181,43 @@ fn emit(decision: &str, reason: String) -> Option<Value> {
     }))
 }
 
+/// Decision JSON for a Jev verdict: `deny`/`ask` always, `allow` only with
+/// `decide_all` (D13); the reason names the tier (or the failure, D15) and
+/// what CARE said (`care`).
+fn jev_output(j: &JudgeRecord, care: &str, decide_all: bool) -> Option<Value> {
+    let why = match (&j.error, j.tier, j.tier_rule.as_deref()) {
+        (Some(e), _, _) => format!("Jev unavailable ({e})"),
+        (None, Some(t), Some(rule)) => format!("Jev {t}: {rule}"),
+        _ => "Jev".to_string(),
+    };
+    match j.verdict {
+        JevVerdict::Allow if !decide_all => None,
+        v => emit(
+            v.as_str(),
+            format!("cancelli: {} -> {}; {care}", why, v.as_str()),
+        ),
+    }
+}
+
+/// D21: decision JSON for a call CARE cannot score. Treated exactly as a
+/// Bash WARN: the judge's verdict decides; a judge failure or a stub asks.
+pub fn unscored_decision_output(o: &JudgeOutcome, reason: &str, decide_all: bool) -> Option<Value> {
+    let care = format!("CARE cannot score this call ({reason}), treated as WARN (D21)");
+    if let Some(j) = o.jev.as_ref() {
+        return jev_output(j, &care, decide_all);
+    }
+    let backend = o.backend.as_deref().unwrap_or("judge");
+    match o.decision {
+        Final::Allow => None,
+        Final::Deny => emit("deny", format!("cancelli: {backend} -> deny; {care}")),
+        Final::Ask => emit("ask", format!("cancelli: {backend} failed -> ask; {care}")),
+        Final::Unadjudicated => emit(
+            "ask",
+            format!("cancelli: no judge configured -> ask; {care}"),
+        ),
+    }
+}
+
 /// Decision JSON for enforce mode. CARE's static verdicts are unchanged
 /// (D12); a Jev verdict names its tier; a Jev `allow` emits only with
 /// `decide_all` (D13); Jev failures ask (D15).
@@ -167,18 +230,7 @@ pub fn decision_output(a: &Analysis, decide_all: bool) -> Option<Value> {
     };
     if let Some(j) = a.judge.as_ref().and_then(|o| o.jev.as_ref()) {
         let care = format!("CARE WARN score {}, rules {}", a.aggregate, rules);
-        let why = match (&j.error, j.tier, j.tier_rule.as_deref()) {
-            (Some(e), _, _) => format!("Jev unavailable ({e})"),
-            (None, Some(t), Some(rule)) => format!("Jev {t}: {rule}"),
-            _ => "Jev".to_string(),
-        };
-        return match j.verdict {
-            JevVerdict::Allow if !decide_all => None,
-            v => emit(
-                v.as_str(),
-                format!("cancelli: {} -> {}; {care}", why, v.as_str()),
-            ),
-        };
+        return jev_output(j, &care, decide_all);
     }
     let (decision, reason) = match a.r#final {
         Final::Allow => return None,
@@ -258,68 +310,94 @@ pub fn run(stdin: &[u8], args: &HookArgs, env: &Env) -> HookOutput {
     let tool_input = payload.get("tool_input").cloned().unwrap_or(Value::Null);
     let mut stdout = String::new();
 
-    if tool == "Bash" {
-        let Some(cmd) = tool_input.get("command").and_then(Value::as_str) else {
-            let mut extra = Map::new();
-            extra.insert("tool_name".into(), json!(tool));
-            extra.insert("session_id".into(), str_field(&payload, "session_id"));
-            extra.insert("tool_use_id".into(), str_field(&payload, "tool_use_id"));
-            log_error(
-                &loaded,
-                "bash_input",
-                "tool_input.command missing or not a string",
-                extra,
-            );
-            return empty;
-        };
-        let source = ContextSource {
-            transcript_path: payload
-                .get("transcript_path")
-                .and_then(Value::as_str)
-                .filter(|p| !p.is_empty())
-                .map(std::path::PathBuf::from),
-            tool_use_id: payload
-                .get("tool_use_id")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            request_override: None,
-        };
-        let (adjudicator, judge_timeout) = adjudicator(&loaded.config, env, source);
-        let opts = Options {
-            mode: loaded.config.mode,
-            home: env.home.clone().unwrap_or_default(),
-            adjudicator,
-            judge_timeout,
-            care: loaded.config.tunables.care.clone(),
-        };
-        match engine::analyze(cmd, &opts) {
-            Err(e) => {
-                let mut extra = Map::new();
-                extra.insert("tool_use_id".into(), str_field(&payload, "tool_use_id"));
-                log_error(&loaded, "analyze", &e.to_string(), extra);
-                return empty;
-            }
-            Ok(a) => {
-                if let Some(o) = &a.judge
-                    && let Some(e) = o.error_message()
-                {
+    // D21: CARE scores a Bash command; every other call is unscorable.
+    let scored: Result<&str, &'static str> = if tool != "Bash" {
+        Err("non-shell tool")
+    } else {
+        match tool_input.get("command") {
+            None | Some(Value::Null) => Err("missing command"),
+            Some(Value::String(c)) if c.trim().is_empty() => Err("empty command"),
+            Some(Value::String(c)) => Ok(c),
+            Some(_) => Err("command is not a string"),
+        }
+    };
+    let source = ContextSource {
+        transcript_path: payload
+            .get("transcript_path")
+            .and_then(Value::as_str)
+            .filter(|p| !p.is_empty())
+            .map(std::path::PathBuf::from),
+        tool_use_id: payload
+            .get("tool_use_id")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        request_override: None,
+    };
+
+    match scored {
+        Ok(cmd) => {
+            let (adjudicator, judge_timeout) = adjudicator(&loaded.config, env, source);
+            let opts = Options {
+                mode: loaded.config.mode,
+                home: env.home.clone().unwrap_or_default(),
+                adjudicator,
+                judge_timeout,
+                care: loaded.config.tunables.care.clone(),
+            };
+            match engine::analyze(cmd, &opts) {
+                Err(e) => {
                     let mut extra = Map::new();
-                    extra.insert("session_id".into(), str_field(&payload, "session_id"));
                     extra.insert("tool_use_id".into(), str_field(&payload, "tool_use_id"));
-                    extra.insert(
-                        "backend".into(),
-                        json!(o.backend.as_deref().unwrap_or("jev")),
-                    );
-                    extra.insert("decision".into(), json!(o.decision.as_str()));
-                    if let Some(j) = &o.jev {
-                        extra.insert("level".into(), json!(j.level));
-                        extra.insert("state_hash".into(), json!(j.state_hash));
-                        extra.insert("request_id".into(), json!(j.request_id));
-                        extra.insert("attempts".into(), json!(j.attempts));
-                    }
-                    log_error(&loaded, "judge", e, extra);
+                    log_error(&loaded, "analyze", &e.to_string(), extra);
+                    return empty;
                 }
-                let decision = decision_output(&a, loaded.config.decide_all);
+                Ok(a) => {
+                    if let Some(o) = &a.judge {
+                        log_judge_error(&loaded, &payload, o, false);
+                    }
+                    let decision = decision_output(&a, loaded.config.decide_all);
+                    rec.insert(
+                        "would_emit".into(),
+                        json!(
+                            decision
+                                .as_ref()
+                                .map(|d| d["hookSpecificOutput"]["permissionDecision"].clone())
+                        ),
+                    );
+                    if let Ok(Value::Object(fields)) = serde_json::to_value(&a) {
+                        rec.extend(fields);
+                    }
+                    if !loaded.config.dry_run
+                        && let Some(d) = decision
+                    {
+                        stdout = d.to_string();
+                    }
+                }
+            }
+        }
+        Err(reason) => {
+            rec.insert(
+                "tool_input".into(),
+                logging::truncate_strings(&tool_input, loaded.config.max_field_bytes),
+            );
+            if !loaded.config.tunables.jev.skips(tool) {
+                // D21: CARE can't score it, so it is a WARN for Jev.
+                let (adjudicator, judge_timeout) = adjudicator(&loaded.config, env, source);
+                let input = JudgeInput {
+                    action: Action::Tool {
+                        name: tool.to_string(),
+                        input: tool_input.clone(),
+                    },
+                    prompt: None,
+                };
+                let mut tags = Tags::default();
+                let outcome = resolution::run_judge(adjudicator, &input, judge_timeout, &mut tags);
+                log_judge_error(&loaded, &payload, &outcome, true);
+                let decision = unscored_decision_output(&outcome, reason, loaded.config.decide_all);
+                rec.insert("care".into(), json!({"supported": false, "reason": reason}));
+                rec.insert("unscored".into(), json!(true));
+                rec.insert("provisional".into(), json!("WARN"));
+                rec.insert("would_adjudicate".into(), json!(true));
                 rec.insert(
                     "would_emit".into(),
                     json!(
@@ -328,9 +406,12 @@ pub fn run(stdin: &[u8], args: &HookArgs, env: &Env) -> HookOutput {
                             .map(|d| d["hookSpecificOutput"]["permissionDecision"].clone())
                     ),
                 );
-                if let Ok(Value::Object(fields)) = serde_json::to_value(&a) {
-                    rec.extend(fields);
-                }
+                rec.insert("judge".into(), json!(outcome));
+                rec.insert("final".into(), json!(outcome.decision));
+                rec.insert(
+                    "fixes_applied".into(),
+                    json!(tags.fixes.into_iter().collect::<Vec<_>>()),
+                );
                 if !loaded.config.dry_run
                     && let Some(d) = decision
                 {
@@ -338,11 +419,6 @@ pub fn run(stdin: &[u8], args: &HookArgs, env: &Env) -> HookOutput {
                 }
             }
         }
-    } else {
-        rec.insert(
-            "tool_input".into(),
-            logging::truncate_strings(&tool_input, loaded.config.max_field_bytes),
-        );
     }
     rec.insert(
         "latency_us".into(),

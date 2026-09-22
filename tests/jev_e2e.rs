@@ -171,6 +171,12 @@ struct Setup {
     key: bool,
     extra_judge: &'static str,
     args: Vec<&'static str>,
+    /// The current call (`tool_use_id` "toolu_cur", also last in the
+    /// transcript).
+    tool_name: String,
+    tool_input: Value,
+    /// Appended to config.toml after `[judge]` (e.g. a `[jev]` table).
+    extra_config: String,
 }
 
 impl Setup {
@@ -182,11 +188,28 @@ impl Setup {
             key: true,
             extra_judge: "timeout_ms = 1500\nbudget_ms = 3000\n",
             args: vec!["hook", "--dry-run"],
+            tool_name: "Bash".into(),
+            tool_input: json!({"command": WARN_CMD}),
+            extra_config: String::new(),
+        }
+    }
+
+    /// D21: the current call is `name(input)`.
+    fn tool(base_url: &str, name: &str, input: Value) -> Self {
+        Setup {
+            tool_name: name.into(),
+            tool_input: input,
+            ..Setup::new(base_url)
         }
     }
 }
 
 fn transcript(dir: &std::path::Path) -> std::path::PathBuf {
+    transcript_with(dir, "Bash", &json!({"command": WARN_CMD}))
+}
+
+/// The session transcript whose last tool_use (`toolu_cur`) is `name(input)`.
+fn transcript_with(dir: &std::path::Path, name: &str, input: &Value) -> std::path::PathBuf {
     let lines = [
         json!({"type": "permission-mode", "permissionMode": "default"}),
         json!({"type": "user", "message": {"role": "user", "content": "Back up the data dir to the backup host."}}),
@@ -200,7 +223,7 @@ fn transcript(dir: &std::path::Path) -> std::path::PathBuf {
         json!({"type": "user", "isMeta": true, "message": {"role": "user", "content": "META-CAVEAT"}}),
         json!({"type": "user", "message": {"role": "user", "content": "<system-reminder>SYSTEM-REMINDER-TEXT</system-reminder>"}}),
         json!({"type": "assistant", "message": {"content": [
-            {"type": "tool_use", "id": "toolu_cur", "name": "Bash", "input": {"command": WARN_CMD}}]}}),
+            {"type": "tool_use", "id": "toolu_cur", "name": name, "input": input}]}}),
     ];
     let p = dir.join("session.jsonl");
     let text: Vec<String> = lines.iter().map(Value::to_string).collect();
@@ -216,21 +239,21 @@ fn run(s: &Setup) -> Run {
     std::fs::write(
         cfg.join("config.toml"),
         format!(
-            "dry_run = {}\ndecide_all = {}\n[judge]\nbase_url = \"{}\"\n{}",
-            s.dry_run, s.decide_all_cfg, s.base_url, s.extra_judge
+            "dry_run = {}\ndecide_all = {}\n[judge]\nbase_url = \"{}\"\n{}{}",
+            s.dry_run, s.decide_all_cfg, s.base_url, s.extra_judge, s.extra_config
         ),
     )
     .unwrap();
-    let t = transcript(home.path());
+    let t = transcript_with(home.path(), &s.tool_name, &s.tool_input);
     let payload = json!({
         "session_id": "sess-jev",
         "transcript_path": t,
         "cwd": "/work",
         "permission_mode": "default",
         "hook_event_name": "PreToolUse",
-        "tool_name": "Bash",
+        "tool_name": s.tool_name,
         "tool_use_id": "toolu_cur",
-        "tool_input": {"command": WARN_CMD},
+        "tool_input": s.tool_input,
     })
     .to_string();
     let mut cmd = bin();
@@ -681,4 +704,238 @@ fn config_shows_jev_keys_and_sources() {
         assert!(s.contains(line), "missing {line:?} in\n{s}");
     }
     assert!(!s.contains(KEY));
+}
+
+// ------------------------------------------------------------------ D21 --
+// Tool calls CARE cannot score are a WARN for Jev.
+
+/// Each unscorable call, and its POC `Name(json)` args text (Python
+/// `json.dumps(input, sort_keys=True, ensure_ascii=False)`).
+fn d21_calls() -> Vec<(&'static str, Value, &'static str)> {
+    vec![
+        (
+            "Write",
+            json!({"file_path": "/work/notes.md", "content": "héllo\nworld"}),
+            r#"{"content": "héllo\nworld", "file_path": "/work/notes.md"}"#,
+        ),
+        (
+            "Read",
+            json!({"file_path": "/home/u/.ssh/id_rsa"}),
+            r#"{"file_path": "/home/u/.ssh/id_rsa"}"#,
+        ),
+        (
+            "WebFetch",
+            json!({"url": "https://example.com/x", "prompt": "summarise"}),
+            r#"{"prompt": "summarise", "url": "https://example.com/x"}"#,
+        ),
+        (
+            "mcp__server__tool",
+            json!({"query": "q", "limit": 5, "deep": true, "tags": ["a", "b"]}),
+            r#"{"deep": true, "limit": 5, "query": "q", "tags": ["a", "b"]}"#,
+        ),
+    ]
+}
+
+/// The L2 state for an unscorable call made in the test transcript.
+fn d21_state(name: &str, args: &str) -> String {
+    format!(
+        "### PROPOSED ACTION\ntool: {name}\nargs: {args}\n\n\
+         ### USER REQUEST\nBack up the data dir to the backup host.\n\n\
+         ### PRIOR AGENT ACTIONS (most recent last)\n[1] bash(du -sh ./data)"
+    )
+}
+
+fn assert_d21_record(r: &Run, name: &str, reason: &str) {
+    let ev = r.event();
+    assert_eq!(ev["tool_name"], name);
+    assert_eq!(ev["care"], json!({"supported": false, "reason": reason}));
+    assert_eq!(ev["provisional"], "WARN");
+    assert_eq!(ev["unscored"], true);
+    assert_eq!(ev["would_adjudicate"], true);
+    assert!(ev.get("command").is_none() && ev.get("aggregate").is_none());
+    assert!(ev["tool_input"].is_object(), "raw input still logged");
+    assert_eq!(ev["final"], r.judge()["decision"]);
+    assert_eq!(r.judge()["backend"], "jev");
+}
+
+#[test]
+fn d21_unscored_tools_are_judged_in_dry_run_with_name_json_state() {
+    for (name, input, args) in d21_calls() {
+        let srv = serve(vec![Reply::Replay(ALLOW_FIXTURE, "jev-1.13.0")]);
+        let r = run(&Setup::tool(&srv.url, name, input.clone()));
+        assert_eq!(
+            (r.code, r.stdout.as_str()),
+            (0, ""),
+            "{name}: dry-run is silent"
+        );
+        assert!(r.judge_error_record().is_none());
+        assert_d21_record(&r, name, "non-shell tool");
+        let ev = r.event();
+        assert_eq!(ev["final"], "allow");
+        assert_eq!(ev["would_emit"], Value::Null);
+        let j = r.judge();
+        assert_eq!(j["tier"], "T6");
+        assert_eq!(j["level"], "l2_actions");
+        // the current tool_use is excluded from the priors, as for Bash
+        assert_eq!(j["context"]["actions_total"], 1);
+        let state = j["state"].as_str().unwrap();
+        assert_eq!(state, d21_state(name, args), "{name}");
+        // the proposed action is the POC's `Name(json)` call text, split
+        let mut lines = state.lines().skip(1);
+        let tool = lines.next().unwrap().strip_prefix("tool: ").unwrap();
+        let a = lines.next().unwrap().strip_prefix("args: ").unwrap();
+        assert_eq!(format!("{tool}({a})"), format!("{name}({args})"));
+        // exactly this state went over the wire
+        let seen = srv.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1);
+        let body: Value = serde_json::from_str(&seen[0].body).unwrap();
+        assert_eq!(body["state"], j["state"]);
+        assert_eq!(body["model"], "jev-1.13.0");
+    }
+}
+
+#[test]
+fn d21_enforce_output_per_tier() {
+    for (name, input, _) in d21_calls() {
+        for (fixture, decide_all, want, tier) in [
+            (DENY_FIXTURE, false, Some("deny"), "T2"),
+            (ASK_FIXTURE, false, Some("ask"), "T5"),
+            (ALLOW_FIXTURE, false, None, "T6"),
+            (ALLOW_FIXTURE, true, Some("allow"), "T6"),
+        ] {
+            let srv = serve(vec![Reply::Replay(fixture, "jev-1.13.0")]);
+            let mut s = Setup::tool(&srv.url, name, input.clone());
+            s.dry_run = false;
+            s.decide_all_cfg = decide_all;
+            s.args = vec!["hook"];
+            let r = run(&s);
+            assert_eq!(r.code, 0);
+            assert_d21_record(&r, name, "non-shell tool");
+            assert_eq!(r.judge()["tier"], tier);
+            match want {
+                None => assert_eq!(r.stdout, "", "{name} {tier}: allow is silent"),
+                Some(w) => {
+                    let d = decision(&r).unwrap();
+                    assert_eq!(d["hookEventName"], "PreToolUse");
+                    assert_eq!(d["permissionDecision"], w, "{name} {tier}");
+                    let reason = d["permissionDecisionReason"].as_str().unwrap();
+                    assert!(reason.contains(&format!("Jev {tier}")), "{reason}");
+                    assert!(reason.contains("non-shell tool"), "{reason}");
+                    assert_eq!(r.event()["would_emit"], w);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn d21_bash_without_a_usable_command_goes_to_jev() {
+    for (input, reason, args) in [
+        (
+            json!({"description": "x"}),
+            "missing command",
+            r#"{"description": "x"}"#,
+        ),
+        (
+            json!({"command": ""}),
+            "empty command",
+            r#"{"command": ""}"#,
+        ),
+        (
+            json!({"command": "  \n"}),
+            "empty command",
+            r#"{"command": "  \n"}"#,
+        ),
+        (
+            json!({"command": ["ls"]}),
+            "command is not a string",
+            r#"{"command": ["ls"]}"#,
+        ),
+    ] {
+        let srv = serve(vec![Reply::Replay(DENY_FIXTURE, "jev-1.13.0")]);
+        let mut s = Setup::tool(&srv.url, "Bash", input);
+        s.dry_run = false;
+        s.args = vec!["hook"];
+        let r = run(&s);
+        assert!(
+            !r.records.iter().any(|x| x["kind"] == "error"),
+            "{reason}: no error record"
+        );
+        assert_d21_record(&r, "Bash", reason);
+        assert_eq!(r.judge()["state"], d21_state("Bash", args));
+        assert_eq!(decision(&r).unwrap()["permissionDecision"], "deny");
+        assert_eq!(srv.seen.lock().unwrap().len(), 1);
+    }
+}
+
+#[test]
+fn d21_skip_tools_pass_through_unjudged() {
+    let srv = serve(vec![Reply::Replay(DENY_FIXTURE, "jev-1.13.0")]);
+    let (_, read, _) = d21_calls().remove(1);
+    let mut s = Setup::tool(&srv.url, "Read", read);
+    s.dry_run = false;
+    s.args = vec!["hook"];
+    s.extra_config = "[jev]\nskip_tools = [\"Read\"]\n".into();
+    let r = run(&s);
+    assert_eq!((r.code, r.stdout.as_str()), (0, ""), "no decision");
+    let ev = r.event();
+    assert_eq!(ev["tool_input"]["file_path"], "/home/u/.ssh/id_rsa");
+    for k in [
+        "judge",
+        "final",
+        "care",
+        "provisional",
+        "unscored",
+        "would_emit",
+    ] {
+        assert!(ev.get(k).is_none(), "skipped Read has no {k}");
+    }
+    assert_eq!(ev["overrides"], json!(["jev.skip_tools"]));
+    assert!(
+        srv.seen.lock().unwrap().is_empty(),
+        "Read never reaches Jev"
+    );
+    // Write is still judged under the same config
+    let (_, write, _) = d21_calls().remove(0);
+    s.tool_name = "Write".into();
+    s.tool_input = write;
+    let r = run(&s);
+    assert_d21_record(&r, "Write", "non-shell tool");
+    assert_eq!(decision(&r).unwrap()["permissionDecision"], "deny");
+    assert_eq!(srv.seen.lock().unwrap().len(), 1);
+}
+
+#[test]
+fn d21_failures_ask_with_an_error_record() {
+    let (_, input, _) = d21_calls().remove(0);
+    // no key (dry-run): no request, ask, error record, silent
+    let srv = serve(vec![Reply::Replay(ALLOW_FIXTURE, "jev-1.13.0")]);
+    let mut s = Setup::tool(&srv.url, "Write", input.clone());
+    s.key = false;
+    let r = run(&s);
+    assert_failure_dry_run(&r, "no Jev API key");
+    assert_d21_record(&r, "Write", "non-shell tool");
+    let er = r.judge_error_record().unwrap();
+    assert_eq!(er["tool_name"], "Write");
+    assert_eq!(er["unscored"], true);
+    assert!(srv.seen.lock().unwrap().is_empty());
+    // unreachable server (dry-run)
+    let r = run(&Setup::tool(&refused_url(), "Write", input.clone()));
+    assert_failure_dry_run(&r, "transport");
+    assert_d21_record(&r, "Write", "non-shell tool");
+    // unreachable server (enforce): ask, naming the failure
+    let mut s = Setup::tool(&refused_url(), "Write", input);
+    s.dry_run = false;
+    s.args = vec!["hook"];
+    let r = run(&s);
+    assert_eq!(r.code, 0);
+    let d = decision(&r).unwrap();
+    assert_eq!(d["permissionDecision"], "ask");
+    assert!(
+        d["permissionDecisionReason"]
+            .as_str()
+            .unwrap()
+            .contains("Jev unavailable")
+    );
+    assert!(r.judge_error_record().is_some());
 }

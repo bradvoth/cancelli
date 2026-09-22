@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::fixes::Tags;
-use crate::jev::JudgeRecord;
+use crate::jev::{Action, JudgeRecord};
 use crate::path::{Access, PathResult, PathTier};
 use crate::pattern::FiredRule;
 use crate::pyre::py_float_repr;
@@ -200,13 +200,15 @@ pub fn render_prompt(
     }
 }
 
-/// What a judge sees for one unresolved WARN.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a judge sees for one unresolved WARN (a CARE WARN, or a D21 call
+/// CARE cannot score).
+#[derive(Debug, Clone, PartialEq)]
 pub struct JudgeInput {
-    /// The raw Bash command.
-    pub command: String,
-    /// CARE Prompt 1 (text judges).
-    pub prompt: JudgePrompt,
+    /// The proposed action: the raw Bash command, or the unscored tool call.
+    pub action: Action,
+    /// CARE Prompt 1 (text judges); `None` for a D21 unscored call, which
+    /// has no CARE score to put in it.
+    pub prompt: Option<JudgePrompt>,
 }
 
 /// What an adjudicator returned.
@@ -436,8 +438,8 @@ mod tests {
 
     fn input(cmd: &str) -> JudgeInput {
         JudgeInput {
-            command: cmd.into(),
-            prompt: render_prompt(cmd, 0.2, &[], &[]),
+            action: Action::Shell(cmd.into()),
+            prompt: Some(render_prompt(cmd, 0.2, &[], &[])),
         }
     }
 

@@ -7,6 +7,7 @@ use serde::Serialize;
 
 use crate::canon::{self, View};
 use crate::fixes::Tags;
+use crate::jev::Action;
 use crate::path::{self, PathResult};
 use crate::pattern::{self, FiredRule};
 use crate::policy::{self, Mode, Provisional, Verdict};
@@ -305,8 +306,8 @@ pub fn analyze(cmd: &str, opts: &Options) -> Result<Analysis, EngineError> {
         Verdict::Warn => {
             let prompt = resolution::render_prompt(cmd, aggregate, &triggered, &rule_ids);
             let input = JudgeInput {
-                command: cmd.to_string(),
-                prompt: prompt.clone(),
+                action: Action::Shell(cmd.to_string()),
+                prompt: Some(prompt.clone()),
             };
             let outcome = resolution::run_judge(
                 Arc::clone(&opts.adjudicator),

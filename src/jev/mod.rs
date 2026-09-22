@@ -1,6 +1,10 @@
 //! Jev (`jev-1.13.0`, TypeSafe AI's hosted "System One" API) as the WARN
 //! adjudicator (D11–D17).
 //!
+//! Called for unresolved CARE WARNs and, since D21, for every tool call
+//! CARE cannot score (an [`Action::Tool`], rendered in the POC's
+//! `Name(json)` form) unless `jev.skip_tools` lists it.
+//!
 //! Pipeline for one unresolved CARE WARN: transcript -> [`transcript::Context`]
 //! (level L2/L1/L0) -> [`state::State`] (the POC's render template, D16) ->
 //! one `POST /v1/systemone` with the rubric's questions for that level ->
@@ -120,6 +124,21 @@ impl JudgeRecord {
     }
 }
 
+/// The proposed action Jev judges.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// A CARE-scored Bash command: `tool: bash`, `args: <command>`.
+    Shell(String),
+    /// D21: a call CARE cannot score, rendered in the POC's `Name(json)`
+    /// form (`tool: <Name>`, `args: <json.dumps(input, sort_keys=True)>`).
+    Tool {
+        /// `tool_name` verbatim.
+        name: String,
+        /// `tool_input` verbatim.
+        input: Value,
+    },
+}
+
 /// Build the state for a Bash command from a context: `tool: bash`,
 /// `args: <command>` (ShellRisk / smoke-gate mapping).
 pub fn build_state(command: &str, ctx: &Context) -> state::State {
@@ -136,6 +155,22 @@ pub fn build_state_with(command: &str, ctx: &Context, limits: &ContextLimits) ->
         ctx.level,
         limits,
     )
+}
+
+/// Build the state for any [`Action`]; [`Action::Shell`] is exactly
+/// [`build_state_with`].
+pub fn build_action_state(action: &Action, ctx: &Context, limits: &ContextLimits) -> state::State {
+    match action {
+        Action::Shell(command) => build_state_with(command, ctx, limits),
+        Action::Tool { name, input } => state::state_from_tool_call_with(
+            name,
+            input,
+            &ctx.user_request,
+            &ctx.prior_actions,
+            ctx.level,
+            limits,
+        ),
+    }
 }
 
 /// The rubric a judge call uses: `jev.rubric_file` when it loaded, else the
@@ -191,10 +226,20 @@ pub fn judge(
     s: &Settings,
     key: &Result<(Secret, KeySource), String>,
 ) -> JudgeRecord {
+    judge_action(&Action::Shell(command.to_string()), src, s, key)
+}
+
+/// Judge one proposed action (a Bash command, or a D21 unscorable call).
+pub fn judge_action(
+    action: &Action,
+    src: &ContextSource,
+    s: &Settings,
+    key: &Result<(Secret, KeySource), String>,
+) -> JudgeRecord {
     let t0 = Instant::now();
     let limits = &s.tuning.context;
     let ctx = transcript::build_with(src, limits);
-    let st = build_state_with(command, &ctx, limits);
+    let st = build_action_state(action, &ctx, limits);
     let mut rec = JudgeRecord {
         backend: "jev",
         level: ctx.level,
@@ -281,8 +326,8 @@ impl Adjudicator for JevAdjudicator {
         Final::Ask
     }
     fn adjudicate(&self, input: &JudgeInput) -> Adjudication {
-        Adjudication::Jev(Box::new(judge(
-            &input.command,
+        Adjudication::Jev(Box::new(judge_action(
+            &input.action,
             &self.source,
             &self.settings,
             &self.key,

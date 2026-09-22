@@ -382,6 +382,9 @@ pub struct JevTunables {
     pub rubric_file: Option<PathBuf>,
     /// The loaded alternative rubric (None: embedded rubric).
     pub rubric: Option<Arc<Rubric>>,
+    /// D21: tool names exempted from Jev when CARE cannot score them
+    /// (logged raw, no judge, no decision). Sorted, deduplicated.
+    pub skip_tools: Vec<String>,
 }
 
 impl Default for JevTunables {
@@ -393,11 +396,18 @@ impl Default for JevTunables {
             context: ContextLimits::default(),
             rubric_file: None,
             rubric: None,
+            skip_tools: Vec::new(),
         }
     }
 }
 
 impl JevTunables {
+    /// D21: whether an unscorable call to `tool` skips Jev (exact,
+    /// case-sensitive name match).
+    pub fn skips(&self, tool: &str) -> bool {
+        self.skip_tools.iter().any(|t| t == tool)
+    }
+
     /// Hash of the rubric in use.
     pub fn rubric_hash(&self) -> &str {
         self.rubric
@@ -641,6 +651,11 @@ pub const KNOBS: &[Knob] = &[
         source: "D19; embedded data/jev/v1_policy_distilled.yaml",
     },
     Knob {
+        key: "jev.skip_tools",
+        doc: "tool names CARE can't score that skip Jev and pass through unjudged (exact match, e.g. [\"Read\", \"mcp__github__get_issue\"])",
+        source: "D21",
+    },
+    Knob {
         key: "jev.thresholds.transport",
         doc: "transport: a5_outbound_data > this (T1, T4)",
         source: P_TIERS,
@@ -799,6 +814,7 @@ impl Tunables {
         v.push(("care.path.traversal_read".into(), f(p.traversal_read)));
         v.push(("care.path.traversal".into(), f(p.traversal)));
         v.push(("jev.rubric_file".into(), json!(j.rubric_hash())));
+        v.push(("jev.skip_tools".into(), json!(j.skip_tools)));
         let t = &j.thresholds;
         v.push(("jev.thresholds.transport".into(), f(t.transport)));
         v.push(("jev.thresholds.sensitive".into(), f(t.sensitive)));
@@ -1220,8 +1236,45 @@ fn load_jev(t: &Table, rd: &mut Rd<'_>, env: &Env) -> JevTunables {
     rd.unknown(
         t,
         "jev",
-        &["rubric_file", "thresholds", "tiers", "verdicts", "context"],
+        &[
+            "rubric_file",
+            "skip_tools",
+            "thresholds",
+            "tiers",
+            "verdicts",
+            "context",
+        ],
     );
+    if let Some(v) = t.get("skip_tools") {
+        let key = "jev.skip_tools";
+        let names: Option<Vec<&str>> = v.as_array().and_then(|a| {
+            a.iter()
+                .map(|x| {
+                    x.as_str()
+                        .filter(|s| !s.trim().is_empty() && s.trim() == *s)
+                })
+                .collect()
+        });
+        match names {
+            None => rd.error(
+                key,
+                format!("{v} is not an array of non-empty tool names without surrounding spaces"),
+            ),
+            Some(names) => {
+                let mut names: Vec<String> = names.into_iter().map(str::to_string).collect();
+                names.sort();
+                names.dedup();
+                if names.iter().any(|n| n == "Bash") {
+                    rd.warn(format!(
+                        "{key}: \"Bash\" only exempts Bash calls without a command; \
+                         CARE-scored Bash WARNs still go to Jev (D12)"
+                    ));
+                }
+                j.skip_tools = names;
+                rd.set.insert(key.into());
+            }
+        }
+    }
     if let Some(th) = rd.table(t, "jev", "thresholds") {
         let p = "jev.thresholds";
         let x = &mut j.thresholds;
@@ -1549,6 +1602,42 @@ mod tests {
         let mut d = Vec::new();
         let l = load(Some(&t), &Env::default(), &mut d);
         (l, d)
+    }
+
+    #[test]
+    fn skip_tools_is_validated_sorted_and_fingerprinted() {
+        let (l, d) = load_str("[jev]\nskip_tools = [\"Write\", \"Read\", \"Read\"]\n");
+        assert!(d.is_empty(), "{d:?}");
+        let j = &l.tunables.jev;
+        assert_eq!(j.skip_tools, vec!["Read".to_string(), "Write".to_string()]);
+        assert!(j.skips("Read") && !j.skips("read") && !j.skips("Edit"));
+        assert_eq!(l.tunables.overrides(), vec!["jev.skip_tools".to_string()]);
+        assert_ne!(l.tunables.fingerprint(), Tunables::default().fingerprint());
+        // order and duplicates don't change the fingerprint
+        let (l2, _) = load_str("[jev]\nskip_tools = [\"Read\", \"Write\"]\n");
+        assert_eq!(l.tunables.fingerprint(), l2.tunables.fingerprint());
+        // explicit empty list == default
+        let (l3, _) = load_str("[jev]\nskip_tools = []\n");
+        assert!(l3.tunables.overrides().is_empty());
+        for bad in [
+            "skip_tools = \"Read\"",
+            "skip_tools = [\"Read\", 3]",
+            "skip_tools = [\"\"]",
+            "skip_tools = [\" Read\"]",
+        ] {
+            let (l, d) = load_str(&format!("[jev]\n{bad}\n"));
+            assert!(l.tunables.jev.skip_tools.is_empty(), "{bad}");
+            assert!(
+                d.iter()
+                    .any(|x| x.level == "error" && x.message.starts_with("jev.skip_tools")),
+                "{bad}: {d:?}"
+            );
+        }
+        let (_, d) = load_str("[jev]\nskip_tools = [\"Bash\"]\n");
+        assert!(
+            d.iter()
+                .any(|x| x.level == "warning" && x.message.contains("Bash"))
+        );
     }
 
     #[test]

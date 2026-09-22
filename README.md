@@ -11,7 +11,10 @@ guard *would* decide before turning enforcement on.
 For now it runs in **dry-run**: it always allows the command and only logs.
 Borderline (WARN) commands are adjudicated by **Jev** (`jev-1.13.0`, TypeSafe
 AI's hosted model; decisions D11–D17), which sees the user's request and the
-agent's prior tool calls. See [Jev adjudicator](#jev-adjudicator), including
+agent's prior tool calls. Every tool call CARE cannot score (`Write`, `Edit`,
+`Read`, `WebFetch`, `mcp__…`, or a `Bash` call without a command) is treated
+as a WARN and also goes to Jev (D21), unless its tool is listed in
+`[jev] skip_tools`. See [Jev adjudicator](#jev-adjudicator), including
 **what data leaves your machine**.
 
 ## What it does
@@ -33,16 +36,24 @@ For a `Bash` tool call it runs the CARE pipeline:
    a WARN with no skip goes to Jev, whose tier decides allow / ask / deny.
    CARE's static ALLOW and DENY are final and never sent to Jev (D12).
 
-Every other tool (`Write`, `Read`, `mcp__…`, …) is logged raw and unscored
-(decision D3); string fields over 4 KiB are truncated with a length and
-SHA-256.
+Every other tool call (`Write`, `Edit`, `Read`, `WebFetch`, `mcp__…`, …),
+and a `Bash` call whose `tool_input.command` is missing, not a string, or
+empty/whitespace, is one CARE **cannot score** (D21). It is logged raw
+(string fields over 4 KiB are truncated with a length and SHA-256, as under
+D3), treated as a **WARN**, and sent to Jev, whose tier decides allow / ask /
+deny exactly as for a Bash WARN (D13, D14, D15 all apply). The proposed
+action Jev sees is the call in the POC's `Name(json)` form: `tool: Write`,
+`args: {"content": "…", "file_path": "…"}` (Python `json.dumps(input,
+sort_keys=True, ensure_ascii=False)`, clipped at `jev.context.field_chars`).
+Tools listed in `[jev] skip_tools` (default empty) keep the old pass-through:
+logged raw, no judge, no decision.
 
 CARE targets Linux bash/sh; cancelli adds a small set of macOS path
 extensions (the `EXT-` table). It is a complementary pre-execution signal,
 **not** a sandbox. The CARE layers read only the command string plus
-`$HOME`/cwd. Only for unresolved WARNs does the Jev step also read the session
-transcript: the human prompts and the agent's prior tool calls, never tool
-results or the agent's prose.
+`$HOME`/cwd. Only for unresolved WARNs and unscorable calls does the Jev step
+also read the session transcript: the human prompts and the agent's prior
+tool calls, never tool results or the agent's prose.
 
 ## Install
 
@@ -91,13 +102,23 @@ cancelli does not modify your settings. Add this to
 
 The hook reads the PreToolUse JSON on stdin, appends one log record, and
 (in dry-run) prints nothing and exits 0. It **fails open**: any error — bad
-JSON, a missing command, an internal panic — is logged as an `error` record
-and the session proceeds.
+JSON, an unwritable log, an internal panic — is logged as an `error` record
+and the session proceeds. (A `Bash` call without a command is no longer an
+error: it is unscorable and goes to Jev, D21.)
 
-Even in dry-run, an unresolved WARN calls Jev (D17). That adds one API round
-trip to those calls only: the POC measured p50 226 ms, p95 437 ms and a max of
-3.0 s over 8,984 calls, and cancelli caps it at `budget_ms`. Without a key
-there is no call; the WARN is logged as a Jev failure (`ask`).
+Even in dry-run, Jev is called for real (D17) on every unresolved Bash WARN
+**and on every non-skipped call CARE cannot score** (D21): each `Write`,
+`Edit`, `Read`, `Glob`, `Grep`, `WebFetch`, `Task`, `mcp__…` call, and so on.
+Since most calls in a typical session are non-Bash, that is **one API round
+trip on most tool calls**, not only on the rare WARN. The POC measured p50
+~226 ms, p95 437 ms and a max of 3.0 s over 8,984 calls, and cancelli caps
+each at `budget_ms` (5 s by default). Each call also costs one metered Jev
+request: the POC's smoke fixtures, whose states are short, used about
+3,250–3,570 input and ~900 output tokens each; a long `Write` body and a long
+history add up to ~20,000 more characters of state (4,000 action + 4,000
+request + 12,000 history). The exact `judge.usage` is logged per call. Use `[jev] skip_tools` to exempt high-volume, low-risk tools
+(for example `["Read", "Glob", "Grep"]`) from the round trip and the cost.
+Without a key there is no call; the call is logged as a Jev failure (`ask`).
 
 ### CLI
 
@@ -165,7 +186,7 @@ catalogs and regexes stay embedded. The guardrails (D20):
 - **Defaults are today's behaviour.** An empty or absent config changes
   nothing. The parity suite, the Jev fidelity/offline tests and the smoke
   replays run on the defaults, and `tests/golden/tunables_default.json` pins
-  the default values (and their fingerprint, `e1b0fc1e6d5d91ad`), so any
+  the default values (and their fingerprint, `2654a8f1b09ee5cc`), so any
   drift of a default fails a test.
 - **Validated per key, fail open.** Weights must be finite and ≥ 0.
   Probabilities, scores and thresholds must be in [0, 1], and
@@ -218,7 +239,22 @@ max_level = "L1"           # never send prior tool calls
 
 [jev]
 rubric_file = "~/rubrics/my_rubric.yaml"
+skip_tools = ["Read", "Glob", "Grep"]   # D21: these pass through unjudged (no Jev call, no decision)
 ```
+
+`skip_tools` (D21) lists tool names, matched exactly and case-sensitively
+(`mcp__server__tool` names in full; no globs), whose calls skip Jev when CARE
+cannot score them. They keep the pre-D21 pass-through: an `event` record
+with the raw `tool_input` and no `judge`, `final` or decision. The default
+is empty, so every non-Bash call is judged. It must be an array of non-empty
+strings without surrounding spaces. Anything else falls back to the empty
+default with an `error` record. The list is sorted and deduplicated, so its
+order does not change the fingerprint. Listing `"Bash"` only exempts Bash
+calls that have no usable command, and it produces a `warning` record,
+because CARE-scored Bash WARNs still go to Jev (D12). Skipping a tool also
+means its input is not sent to TypeSafe (see
+[data egress](#data-egress-what-leaves-your-machine)), and there is no Jev
+round trip for it.
 
 `rubric_file` loads an alternative rubric YAML with the same parser and lint
 as the embedded one. A `warning` record names it and its `rubric_hash`. The
@@ -316,6 +352,7 @@ writes the same list as comments):
 | `care.path.traversal_read` | `0.3` | s_path: ../ under a read-only head | care/path.py:151-245 PathValidator.validate |
 | `care.path.traversal` | `0.5` | s_path: ../ otherwise | care/path.py:151-245 PathValidator.validate |
 | `jev.rubric_file` | (embedded, `0fd1f245ae1c7ef3`) | alternative rubric YAML (logged and fingerprinted by its rubric_hash) | D19; embedded data/jev/v1_policy_distilled.yaml |
+| `jev.skip_tools` | `[]` | tool names CARE can't score that skip Jev and pass through unjudged (exact match, e.g. ["Read", "mcp__github__get_issue"]) | D21 |
 | `jev.thresholds.transport` | `0.95` | transport: a5_outbound_data > this (T1, T4) | FINDINGS §5; jev-integration-spec §4.2 |
 | `jev.thresholds.sensitive` | `0.5` | sensitive: max(a1_reads_credentials, a7_personal_data) > this (T1, T4) | FINDINGS §5; jev-integration-spec §4.2 |
 | `jev.thresholds.unknown` | `0.5` | unknown: a6 argmax one-hot for unknown_remote > this (T1) | rubric a6 use: predicate; jev-integration-spec §4.2 declared row |
@@ -365,6 +402,7 @@ jev/rubric), and whether it is exposed:
 | Jev tier order and verdicts (jev/decide.rs `TIERS`) | order + 6 verdicts | `jev.tiers.order`, `jev.verdicts.*` |
 | Jev context (jev/state.rs, jev/transcript.rs) | 4,000 / 12,000 chars, max level | `jev.context.*` |
 | Jev rubric (jev/rubric.rs) | embedded YAML | `jev.rubric_file` |
+| Tools exempt from D21 (hook.rs) | none (empty list) | `jev.skip_tools` |
 
 Deliberately **not** exposed, and why:
 
@@ -401,10 +439,35 @@ score + evidence), `fired_rules[{id,tier,conf,pi,family,effective,…}]`,
 `skip_predicate`, `would_adjudicate`, `judge_prompt` (CARE Prompt 1, when it
 would adjudicate), `judge`, `final` (`allow`|`deny`|`ask`|`unadjudicated`),
 `would_emit` (the decision enforce mode would send, given `decide_all`),
-`fixes_applied[]`, `ext_applied[]`. For other tools it adds `tool_input`
-(truncated).
+`fixes_applied[]`, `ext_applied[]`. Bash records are unchanged by D21.
 
-For a WARN that reaches Jev, `judge` is the full Jev record (D17):
+For a call CARE cannot score (D21: any non-Bash tool, or a Bash call with a
+missing, non-string or empty `command`), an `event` adds:
+
+- `tool_input`: the raw input, strings over `max_field_bytes` truncated with
+  `len` and `sha256`, as before D21.
+- `care`: `{"supported": false, "reason": …}` in place of CARE scores. The
+  reason is `"non-shell tool"`, `"missing command"`, `"empty command"` or
+  `"command is not a string"`.
+- `unscored: true` and `provisional: "WARN"`. `provisional` is deliberately a
+  plain string, not the per-mode `{strict,balanced,auto}` object: there is
+  no score, so the WARN is by rule (D21) and the same in every mode. Filter
+  on `unscored` to keep these records out of CARE score calibration.
+- `would_adjudicate: true`, and `judge`, the same schema as for a Bash WARN
+  (below). Its `state` renders the proposed action as `tool: <Name>` /
+  `args: <json>`.
+- `final` (`allow`|`ask`|`deny`; `unadjudicated` with the stub backend),
+  `would_emit`, and `fixes_applied[]` (only FIX-008, the judge backstop,
+  can appear).
+
+There is no `command`, `views`, `layers`, `aggregate` or `judge_prompt`. The
+judge `error` record for such a call also carries `tool_name` and
+`unscored: true`. A tool listed in `[jev] skip_tools` gets only the raw
+`tool_input` record, as before D21: no `care`, `judge`, `final` or
+`would_emit`.
+
+For a WARN that reaches Jev (CARE's, or a D21 unscorable call), `judge` is
+the full Jev record (D17):
 `backend`, `decision`, `level` (`l2_actions` | `l1_request` | `l0_action`),
 `context{level_reason, prompts_total, prompts_kept, actions_total,
 bad_lines}`, `questions_sent[]`, `state` (the exact text sent),
@@ -435,6 +498,10 @@ jq -r 'select(.kind=="event") | (.fixes_applied + .ext_applied)[]' \
 jq -r 'select(.judge.backend=="jev") | [.ts,.judge.tier,.judge.verdict,.judge.level,.judge.latency_ms,.command] | @tsv' \
   ~/.local/share/cancelli/events-*.jsonl
 
+# D21: what Jev decided on calls CARE can't score, per tool
+jq -r 'select(.unscored) | [.tool_name, .care.reason, .judge.tier, .final, .judge.latency_ms] | @tsv' \
+  ~/.local/share/cancelli/events-*.jsonl | sort | uniq -c | sort -rn
+
 # context level Jev actually got, and why
 jq -r 'select(.judge.backend=="jev") | .judge.context.level_reason' \
   ~/.local/share/cancelli/events-*.jsonl | sort | uniq -c
@@ -460,6 +527,8 @@ Without `--dry-run` (and with `dry_run = false`) the hook emits a decision:
 | Jev T6 | nothing; `allow` only with `decide_all` (D13) |
 | Jev failure (D15) | `ask`, reason says Jev was unavailable and why |
 | `backend = "stub"` WARN | `ask` |
+| Call CARE can't score (D21), not in `skip_tools` | as a Jev WARN above: T1/T2 `deny`, T3–T5 `ask`, T6 nothing (`allow` with `decide_all`), failure `ask`, stub `ask` |
+| Tool in `[jev] skip_tools` | nothing (normal permission flow) |
 
 Decision D6 keeps the registered hook in dry-run; the Jev thresholds are
 calibrated on a synthetic corpus and are to be re-validated on your own
@@ -470,17 +539,27 @@ dry-run data before enforcing.
 Jev (`jev-1.13.0`) answers a fixed rubric of 40 yes/no, graded and
 categorical questions about a proposed action. The rubric, render template
 and tier rules are ported from the `jev_gate` proof of concept
-(`docs/research/jev-integration-spec.md`). cancelli calls it only for Bash
-commands that CARE leaves at WARN with no skip predicate (D12). Everything
-else is decided by CARE alone, without a network call.
+(`docs/research/jev-integration-spec.md`). cancelli calls it for Bash
+commands that CARE leaves at WARN with no skip predicate (D12), and for every
+tool call CARE cannot score unless its tool is in `[jev] skip_tools` (D21).
+CARE's static ALLOW and DENY are decided by CARE alone, without a network
+call.
 
 ### Data egress: what leaves your machine
 
-For each unresolved WARN, and only then, cancelli sends one HTTPS `POST` to
-`{base_url}/v1/systemone` (default **api.typesafe.ai**). The request holds:
+For each unresolved Bash WARN, and for **every tool call CARE cannot score
+whose tool is not in `[jev] skip_tools`** (D21; the default list is empty,
+so by default that is every non-Bash call), cancelli sends one HTTPS `POST`
+to `{base_url}/v1/systemone` (default **api.typesafe.ai**). The request
+holds:
 
-- **the Bash command** (clipped at 4,000 characters, plus any base64, hex or
-  `$IFS` payload decoded from it);
+- **the proposed action**: the Bash command, or, for any other tool, its
+  **full `tool_input` verbatim** as JSON (clipped at 4,000 characters,
+  `jev.context.field_chars`), plus any base64, hex or `$IFS` payload decoded
+  from it. That means **`Write`/`Edit` file bodies** (the new content, the
+  old and new strings) up to the clip, **`Read` paths** (and so the names of
+  files the agent opens, e.g. `~/.ssh/id_rsa`), `WebFetch` URLs and prompts,
+  `Grep` patterns, `Task` prompts and every MCP tool's arguments;
 - **your prompts** from the session transcript: every prompt you typed, up
   to 4,000 characters, with the most recent always kept (JEV-DEV-001);
 - **the agent's prior tool calls with their arguments**: every earlier
@@ -490,10 +569,12 @@ For each unresolved WARN, and only then, cancelli sends one HTTPS `POST` to
   that appeared in commands**;
 - the 38–40 rubric questions and the model name.
 
-It never sends tool **results**, the agent's text or thinking, system
-reminders, other hooks' output, or your key in the body. CARE ALLOW/DENY
-commands and non-Bash tool calls are never sent. `backend = "stub"` disables
-all egress.
+It never sends tool **results** (so not the content a `Read` returns), the
+agent's text or thinking, system reminders, other hooks' output, or your key
+in the body. CARE ALLOW/DENY commands and calls to tools in `skip_tools` are
+never sent as the proposed action (they can still appear among the prior
+tool calls of a later request, as before). `backend = "stub"` disables all
+egress.
 
 ### Key setup
 
@@ -517,8 +598,16 @@ unresolved WARN is a Jev failure (`ask`), and no request is made.
 
 ### How a Claude Code call is mapped (D16)
 
-- **Proposed action**: `tool: bash`, `args: <tool_input.command>`, the same
-  mapping the POC's ShellRisk and smoke-gate paths used.
+- **Proposed action**: for a CARE-scored Bash command, `tool: bash`,
+  `args: <tool_input.command>`, the same mapping the POC's ShellRisk and
+  smoke-gate paths used. For a call CARE cannot score (D21), the POC's
+  non-shell `Name(json)` form, the same text as the call's prior-action
+  rendering split into its two halves: `tool: <tool_name>` verbatim (e.g.
+  `Write`, `mcp__github__create_issue`, or `Bash` for a Bash call without a
+  command), `args: <json.dumps(tool_input, sort_keys=True,
+  ensure_ascii=False)>`, clipped at `jev.context.field_chars` with the POC's
+  truncation marker, decoded forms taken from the unclipped args. Tool names
+  are not renamed to the calibration corpus's snake_case vocabulary.
 - **User request**: the human prompts in `transcript_path`: `user` records
   whose content is a string or `text` blocks. Records flagged
   `isMeta`/`isCompactSummary`/`isSidechain` are dropped, as are `tool_result`
@@ -812,8 +901,14 @@ Kept minimal; each earns its place:
   transcript is treated as prior (L2). Calls made immediately before this one
   may also still be unwritten and so missing from the prior actions. Check
   `judge.context.level_reason` / `actions_total` in the logs.
-- **Bash-only scoring** (D3). Writes to `~/.zshrc` via the `Write` tool, a
-  persistence vector, are logged but not scored — CARE never sees them.
+- **Bash-only CARE scoring** (D3). CARE never scores a `Write` to
+  `~/.zshrc` (a persistence vector) or any other non-Bash call. Since D21
+  those calls are judged by Jev alone, which has no static fallback: a Jev
+  T6 (allow) passes them, and they depend on Jev's calibration, which was
+  done on generic tool names (`write_file`, `read_file`), not Claude Code's.
+- **D21 cost.** Every non-skipped non-Bash call is a Jev request (latency,
+  metered tokens, egress). See [Register as a hook](#register-as-a-hook) and
+  `[jev] skip_tools`.
 - **Stateless** (matching the paper): no cross-turn correlation, so staged
   download→chmod→exec chains across commands are out of scope.
 - **`str.isprintable()`** is approximated for non-ASCII during base64/printf
