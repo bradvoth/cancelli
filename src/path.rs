@@ -11,6 +11,7 @@ use serde::Serialize;
 use crate::fixes::Tags;
 use crate::py_re;
 use crate::pyre::{PyRegex, basename, py_split, py_strip};
+use crate::tunables::PathScores;
 
 /// Sensitivity tier of a path hit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -427,8 +428,20 @@ fn alias_private(p: &str) -> Option<String> {
     None
 }
 
-/// `PathValidator.validate` (path.py:151-245) on one view.
+/// `PathValidator.validate` (path.py:151-245) on one view, built-in scores.
 pub fn validate(view: usize, cmd: &str, home: &str, tags: &mut Tags) -> PathResult {
+    validate_with(view, cmd, home, tags, &PathScores::default())
+}
+
+/// [`validate`] with tunable tier scores (`care.path`). The early return on
+/// the first system-root/critical hit is kept whatever its score.
+pub fn validate_with(
+    view: usize,
+    cmd: &str,
+    home: &str,
+    tags: &mut Tags,
+    sc: &PathScores,
+) -> PathResult {
     let mut res = PathResult {
         view,
         score: 0.0,
@@ -522,7 +535,7 @@ pub fn validate(view: usize, cmd: &str, home: &str, tags: &mut Tags) -> PathResu
             }
             if !decided {
                 add_trig(&mut res, p0, false);
-                res.score = 1.0;
+                res.score = sc.system_root;
                 res.reason = format!("destructive_on_system_root:{p0}");
                 decided = true;
             }
@@ -547,7 +560,7 @@ pub fn validate(view: usize, cmd: &str, home: &str, tags: &mut Tags) -> PathResu
             }
             if !decided {
                 add_trig(&mut res, p0, false);
-                res.score = 1.0;
+                res.score = sc.critical;
                 res.reason = format!("critical_path:{p0}");
                 decided = true;
             }
@@ -569,8 +582,8 @@ pub fn validate(view: usize, cmd: &str, home: &str, tags: &mut Tags) -> PathResu
                 if let Some(e) = ext {
                     tags.ext(e);
                 }
-                if !decided && 0.85 > max_score {
-                    max_score = 0.85;
+                if !decided && sc.secret > max_score {
+                    max_score = sc.secret;
                     res.reason = format!("secret_path:{p0}");
                 }
                 add_trig(&mut res, p0, decided);
@@ -592,9 +605,9 @@ pub fn validate(view: usize, cmd: &str, home: &str, tags: &mut Tags) -> PathResu
                 || (sp.starts_with('~') && expanded.starts_with(&spx));
             if matched {
                 let (score, why) = match access {
-                    Access::Write => (0.70, "sensitive_write"),
-                    Access::Read => (0.10, "sensitive_read"),
-                    Access::Ambiguous => (0.35, "sensitive_ambiguous"),
+                    Access::Write => (sc.sensitive_write, "sensitive_write"),
+                    Access::Read => (sc.sensitive_read, "sensitive_read"),
+                    Access::Ambiguous => (sc.sensitive_ambiguous, "sensitive_ambiguous"),
                 };
                 let ext = ext.or(alias_ext);
                 res.hits.push(PathHit {
@@ -617,7 +630,11 @@ pub fn validate(view: usize, cmd: &str, home: &str, tags: &mut Tags) -> PathResu
 
         // (e) traversal
         if p.contains("../") {
-            let score = if is_read { 0.3 } else { 0.5 };
+            let score = if is_read {
+                sc.traversal_read
+            } else {
+                sc.traversal
+            };
             res.hits.push(PathHit {
                 path: p0.clone(),
                 tier: PathTier::Traversal,

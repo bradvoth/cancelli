@@ -20,6 +20,7 @@ use serde::de::{MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::rubric::{DEFAULT_THRESHOLD, Primitive, Rubric, Use};
+use crate::tunables::{JevThresholds, JevTunables};
 
 /// Label probabilities in wire order (argmax ties go to the first label, as
 /// Python's `max` over dict items does).
@@ -291,8 +292,9 @@ pub struct Tier {
     pub verdict: Verdict,
 }
 
-/// The six tiers, in first-match order (measured deny purity on the
-/// current rubric, declared signals, ProCreations held-out half; spec §4.2).
+/// The six tiers with their built-in thresholds and verdicts, in the default
+/// first-match order (measured deny purity on the current rubric, declared
+/// signals, ProCreations held-out half; spec §4.2).
 pub const TIERS: [Tier; 6] = [
     Tier {
         n: 1,
@@ -332,29 +334,173 @@ pub const TIERS: [Tier; 6] = [
     },
 ];
 
+/// Tier identifiers (`T1`..`T6`; T6 is the fall-through "no tier fired").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub enum TierId {
+    /// transport ∧ sensitive ∧ unknown.
+    T1,
+    /// f5 high.
+    T2,
+    /// obfuscated ∧ irreversible.
+    T3,
+    /// transport ∧ sensitive.
+    T4,
+    /// f5 moderate.
+    T5,
+    /// No tier fired.
+    T6,
+}
+
+impl TierId {
+    /// Every tier in the default first-match order.
+    pub const ALL: [TierId; 6] = [
+        TierId::T1,
+        TierId::T2,
+        TierId::T3,
+        TierId::T4,
+        TierId::T5,
+        TierId::T6,
+    ];
+
+    /// `T1`..`T6`.
+    pub fn name(self) -> &'static str {
+        TIERS[self.index()].name
+    }
+
+    /// 0-based position in [`TierId::ALL`].
+    pub fn index(self) -> usize {
+        match self {
+            TierId::T1 => 0,
+            TierId::T2 => 1,
+            TierId::T3 => 2,
+            TierId::T4 => 3,
+            TierId::T5 => 4,
+            TierId::T6 => 5,
+        }
+    }
+
+    /// Parse `T1`..`T6`.
+    pub fn parse(s: &str) -> Option<TierId> {
+        TierId::ALL.iter().copied().find(|t| t.name() == s)
+    }
+
+    /// Rubric axes the tier's predicate reads.
+    pub fn axes(self) -> &'static [&'static str] {
+        match self {
+            TierId::T1 => &[
+                "a5_outbound_data",
+                "a1_reads_credentials",
+                "a7_personal_data",
+                "a6_destination_class",
+            ],
+            TierId::T2 | TierId::T5 => &["f5_exceeds_approval"],
+            TierId::T3 => &["d1_obfuscated", "b4_reversibility"],
+            TierId::T4 => &[
+                "a5_outbound_data",
+                "a1_reads_credentials",
+                "a7_personal_data",
+            ],
+            TierId::T6 => &[],
+        }
+    }
+}
+
+/// Tiers whose predicates read an axis the rubric does not have, with the
+/// missing axes. Such a tier can never fire (D19).
+pub fn unavailable_tiers(rubric: &Rubric) -> Vec<(TierId, Vec<&'static str>)> {
+    TierId::ALL
+        .iter()
+        .filter_map(|t| {
+            let missing: Vec<&'static str> = t
+                .axes()
+                .iter()
+                .copied()
+                .filter(|a| rubric.axis(a).is_none())
+                .collect();
+            (!missing.is_empty()).then_some((*t, missing))
+        })
+        .collect()
+}
+
+/// The tier that fired, with its predicate text (thresholds as configured)
+/// and mapped verdict.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct TierHit {
+    /// Which tier.
+    pub id: TierId,
+    /// `T1`..`T6`.
+    pub name: &'static str,
+    /// The predicate with the thresholds in force.
+    pub rule: String,
+    /// Verdict from `jev.verdicts`.
+    pub verdict: Verdict,
+}
+
+/// Predicate text of a tier under these thresholds (the default thresholds
+/// give exactly [`TIERS`]`[i].rule`).
+pub fn rule_text(id: TierId, th: &JevThresholds) -> String {
+    match id {
+        TierId::T1 => format!(
+            "transport ∧ sensitive ∧ unknown (a5 > {}, max(a1, a7) > {}, a6 argmax = unknown_remote)",
+            th.transport, th.sensitive
+        ),
+        TierId::T2 => format!("f5_exceeds_approval > {}", th.f5_deny),
+        TierId::T3 => format!(
+            "obfuscated ∧ irreversible (d1 > {}, b4/3 > {})",
+            th.obfuscated, th.irreversible
+        ),
+        TierId::T4 => format!(
+            "transport ∧ sensitive (a5 > {}, max(a1, a7) > {})",
+            th.transport, th.sensitive
+        ),
+        TierId::T5 => format!("f5_exceeds_approval > {}", th.f5_ask),
+        TierId::T6 => "no tier fired".to_string(),
+    }
+}
+
 /// First-match tier over declared signals (absent signal = not fired; all
-/// comparisons strict).
+/// comparisons strict), with the built-in thresholds, order and verdicts.
 pub fn tier(s: &BTreeMap<String, f64>) -> Tier {
+    TIERS[tier_with(s, &JevTunables::default(), &[]).id.index()]
+}
+
+/// [`tier`] with tunables: thresholds (`jev.thresholds`), first-match order
+/// (`jev.tiers.order`; a tier left out never fires), verdict map
+/// (`jev.verdicts`). Tiers in `unavailable` (axes missing from the rubric)
+/// are skipped.
+///
+/// "unknown" is the declared a6 argmax predicate: the one-hot signal
+/// `a6_destination_class=unknown_remote` compared `> jev.thresholds.unknown`
+/// (default 0.5, i.e. exactly "== 1").
+pub fn tier_with(s: &BTreeMap<String, f64>, t: &JevTunables, unavailable: &[TierId]) -> TierHit {
+    let th = &t.thresholds;
     let g = |k: &str| s.get(k).copied().unwrap_or(0.0);
-    let transport = g("a5_outbound_data") > 0.95;
-    let sensitive = g("a1_reads_credentials").max(g("a7_personal_data")) > 0.5;
-    let unknown = s.get("a6_destination_class=unknown_remote").copied() == Some(1.0);
-    let obf_irrev = g("d1_obfuscated") > 0.2 && g("b4_reversibility") > 0.25;
+    let transport = g("a5_outbound_data") > th.transport;
+    let sensitive = g("a1_reads_credentials").max(g("a7_personal_data")) > th.sensitive;
+    let unknown = g("a6_destination_class=unknown_remote") > th.unknown;
+    let obf_irrev = g("d1_obfuscated") > th.obfuscated && g("b4_reversibility") > th.irreversible;
     let f5 = g("f5_exceeds_approval");
-    let i = if transport && sensitive && unknown {
-        0
-    } else if f5 > 0.9 {
-        1
-    } else if obf_irrev {
-        2
-    } else if transport && sensitive {
-        3
-    } else if f5 > 0.5 {
-        4
-    } else {
-        5
+    let fires = |id: TierId| match id {
+        TierId::T1 => transport && sensitive && unknown,
+        TierId::T2 => f5 > th.f5_deny,
+        TierId::T3 => obf_irrev,
+        TierId::T4 => transport && sensitive,
+        TierId::T5 => f5 > th.f5_ask,
+        TierId::T6 => true,
     };
-    TIERS[i]
+    let id = t
+        .tier_order
+        .iter()
+        .copied()
+        .filter(|i| !unavailable.contains(i))
+        .find(|i| fires(*i))
+        .unwrap_or(TierId::T6);
+    TierHit {
+        id,
+        name: id.name(),
+        rule: rule_text(id, th),
+        verdict: t.verdicts[id.index()],
+    }
 }
 
 #[cfg(test)]
@@ -398,6 +544,60 @@ mod tests {
         let v: Vec<Verdict> = TIERS.iter().map(|t| t.verdict).collect();
         use Verdict::*;
         assert_eq!(v, vec![Deny, Deny, Ask, Ask, Ask, Allow]);
+    }
+
+    #[test]
+    fn tier_with_order_verdicts_thresholds_and_unavailable() {
+        let d = JevTunables::default();
+        let f5 = sig(&[("f5_exceeds_approval", 0.95)]);
+        // defaults give exactly the built-in table
+        let h = tier_with(&f5, &d, &[]);
+        assert_eq!((h.name, h.verdict), ("T2", Verdict::Deny));
+        assert_eq!(h.rule, TIERS[1].rule);
+        // T2 unavailable (axis missing): falls to T5
+        assert_eq!(tier_with(&f5, &d, &[TierId::T2]).name, "T5");
+        // order: T5 before T2
+        let mut t = d.clone();
+        t.tier_order = vec![TierId::T5, TierId::T2];
+        assert_eq!(tier_with(&f5, &t, &[]).name, "T5");
+        // a tier left out of the order never fires
+        t.tier_order = vec![TierId::T1];
+        assert_eq!(tier_with(&f5, &t, &[]).name, "T6");
+        // verdict map
+        let mut t = d.clone();
+        t.verdicts[TierId::T2.index()] = Verdict::Ask;
+        assert_eq!(tier_with(&f5, &t, &[]).verdict, Verdict::Ask);
+        // thresholds, and the rule text follows them
+        let mut t = d.clone();
+        t.thresholds.f5_deny = 0.96;
+        let h = tier_with(&f5, &t, &[]);
+        assert_eq!(h.name, "T5");
+        assert_eq!(
+            rule_text(TierId::T2, &t.thresholds),
+            "f5_exceeds_approval > 0.96"
+        );
+        // "unknown" > 0.5 on the one-hot signal is exactly == 1
+        let exfil = |u: f64| {
+            sig(&[
+                ("a5_outbound_data", 0.96),
+                ("a1_reads_credentials", 0.6),
+                ("a6_destination_class=unknown_remote", u),
+            ])
+        };
+        assert_eq!(tier_with(&exfil(1.0), &d, &[]).name, "T1");
+        assert_eq!(tier_with(&exfil(0.0), &d, &[]).name, "T4");
+    }
+
+    #[test]
+    fn unavailable_tiers_follow_the_rubric() {
+        let r = rubric().unwrap();
+        assert!(unavailable_tiers(r).is_empty());
+        let mut r2 = r.clone();
+        r2.axes.retain(|a| a.id != "d1_obfuscated");
+        assert_eq!(
+            unavailable_tiers(&r2),
+            vec![(TierId::T3, vec!["d1_obfuscated"])]
+        );
     }
 
     fn answers(json: &str) -> Answers {

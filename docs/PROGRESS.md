@@ -59,3 +59,26 @@ Constraints: no commit; tte read-only (never .env); no network (crates resolved 
 - J7 done: tests/jev_e2e.rs (12, real binary + local server: refused/hang/no key/0644 key file/wrong model/503-then-ok/401, dry-run full record + wire capture, decide_all on/off, deny/ask tiers, D12 static never sent, judge subcommand, config); e2e.rs WARN test updated (unadjudicated -> ask, D15) + stub-backend test + non-UTF-8 env regression (fixed Env::from_process panic); tests/jev_live.rs (2, #[ignore], not run)
 - J8 done: README Jev section (egress, key setup, mapping, tiers + purity, decide_all/auto mode, failures, JEV-DEV-001..004, fidelity + live tests, ureq rationale), NOTICE, COMMIT_MSG (Jev commit), docs_consistency checks JEV-DEV ids
 - FINAL: 111 offline tests pass (lib 74, docs 2, e2e 18, jev_e2e 12, jev_offline 4, parity 1); install (ignored) passes with CARGO_NET_OFFLINE=true; jev_live (2, ignored) written, NOT run (user runs with a key); clippy -D warnings + fmt clean; not committed
+
+---
+# Tunables (D18–D20) — started 2026-09-22
+
+Constraints: no commit; don't touch ~/Documents/tte, credentials, ~/.claude/settings.json; never read ~/.config/cancelli; no network; tests use temp HOME/XDG_CONFIG_HOME.
+
+## Milestones
+- [x] T0 inventory of hard-coded constants (README table)
+- [x] T1 src/tunables.rs: Tunables{care,jev} + Default = current constants, flatten/fingerprint/overrides, TOML load + per-key validation
+- [x] T2 thread CARE tunables (policy, semantic, structure, path, pattern, resolution, engine); parity unchanged
+- [x] T3 thread Jev tunables (decide tiers/order/verdicts, gate, context limits, max level, rubric_file); jev_offline unchanged
+- [x] T4 config/hook/main wiring: log fields config_fingerprint/overrides/rubric_hash, `config` listing, `config --init`
+- [x] T5 tests: golden default snapshot, per-group e2e, invalid values, fingerprint
+- [x] T6 README Tuning section + inventory, COMMIT_MSG, clippy/fmt, full test run
+
+## Design notes
+- TOML layout: [care.weights] [care.modes.<mode>] tau_low/tau_high [care.resolution] theta_rule/theta_sem/h_sem [care.provenance] [care.class_base] [care.structure] [care.path] [care.rules."SE-P-NNN"]; [jev] rubric_file, [jev.thresholds] [jev.tiers] order [jev.verdicts] [jev.context]
+- a6 "unknown": signal `a6_destination_class=unknown_remote` > jev.thresholds.unknown (0.5; ≡ argmax==1); gate jev.thresholds.unknown_f5_gate overrides a6 `when.over`
+- T1–T4 done: all pre-existing tests pass unchanged on defaults (lib 79, e2e 18, jev_e2e 12, jev_offline 4, parity 1, docs 2).
+- Records now carry config_fingerprint, overrides[], rubric_hash (base_record). `config` lists every tunable + all 139 rules; `config --init` = DEFAULT_FILE + commented tunables (tunables::init_template).
+- T5 done: tests/tuning_e2e.rs (17, real binary, temp HOME+XDG_CONFIG_HOME, fixture server), tests/tunables_golden.rs (1; golden tests/golden/tunables_default.json, fingerprint e1b0fc1e6d5d91ad), +4 tunables unit, +2 decide, +1 transcript, +1 state. Pre-existing test files untouched (git diff tests/ empty). clippy -D warnings + fmt clean.
+- T6 done: README "Tuning" (table generated from `config --init`, checked by tests/tunables_golden.rs), constant inventory + not-exposed table, examples, calibration-from-logs, caution; COMMIT_MSG rewritten for this change (all FIX/EXT/JEV-DEV ids kept for docs_consistency); DESIGN log-record line mentions the new fields.
+- FINAL: 140 offline tests pass (lib 83, docs 2, e2e 18, jev_e2e 12, jev_offline 4, parity 1, tunables_golden 2, tuning_e2e 17); clippy --all-targets -D warnings + fmt clean; not committed.

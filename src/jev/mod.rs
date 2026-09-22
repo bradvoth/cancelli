@@ -15,6 +15,7 @@ pub mod rubric;
 pub mod state;
 pub mod transcript;
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -22,9 +23,11 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::resolution::{Adjudication, Adjudicator, Final, JudgeInput};
+use crate::tunables::{ContextLimits, JevTunables};
 use client::{KeySource, PINNED_MODEL, Secret, Transport};
 use decide::{Usage, Verdict};
 use pyjson::{J, compact};
+use rubric::Rubric;
 use state::Level;
 use transcript::{Context, ContextSource};
 
@@ -57,6 +60,8 @@ pub struct Settings {
     pub model: String,
     /// D13: a Jev `allow` emits `allow`.
     pub decide_all: bool,
+    /// Jev tunables (D19), including the rubric in use.
+    pub tuning: JevTunables,
 }
 
 /// The judge record (logged as `judge`; printed by `cancelli judge`).
@@ -84,8 +89,8 @@ pub struct JudgeRecord {
     pub signals: Option<BTreeMap<String, f64>>,
     /// Tier name (`T1`..`T6`) when answers were usable.
     pub tier: Option<&'static str>,
-    /// Tier predicate text.
-    pub tier_rule: Option<&'static str>,
+    /// Tier predicate text (with the thresholds in force).
+    pub tier_rule: Option<String>,
     /// Verdict (`ask` on any failure).
     pub verdict: Verdict,
     /// What enforce mode emits for this verdict (`null` = nothing).
@@ -118,14 +123,50 @@ impl JudgeRecord {
 /// Build the state for a Bash command from a context: `tool: bash`,
 /// `args: <command>` (ShellRisk / smoke-gate mapping).
 pub fn build_state(command: &str, ctx: &Context) -> state::State {
-    state::state_from_shell_command(
+    build_state_with(command, ctx, &ContextLimits::default())
+}
+
+/// [`build_state`] under `jev.context` limits.
+pub fn build_state_with(command: &str, ctx: &Context, limits: &ContextLimits) -> state::State {
+    state::state_from_shell_command_with(
         command,
         &ctx.user_request,
         &ctx.prior_actions,
         &[],
         ctx.level,
+        limits,
     )
 }
+
+/// The rubric a judge call uses: `jev.rubric_file` when it loaded, else the
+/// embedded one, with the a6 gate set to `jev.thresholds.unknown_f5_gate`
+/// (identity-neutral: `when` is not part of the rubric hash or the wire
+/// questions).
+pub fn effective_rubric(t: &JevTunables) -> Result<Cow<'_, Rubric>, String> {
+    let base: &Rubric = match &t.rubric {
+        Some(r) => r,
+        None => rubric::rubric()?,
+    };
+    let gate = t.thresholds.unknown_f5_gate;
+    match base.axis(A6).and_then(|a| a.when.as_ref()) {
+        Some(w) if w.over != gate => {
+            let mut r = base.clone();
+            if let Some(w) = r
+                .axes
+                .iter_mut()
+                .find(|a| a.id == A6)
+                .and_then(|a| a.when.as_mut())
+            {
+                w.over = gate;
+            }
+            Ok(Cow::Owned(r))
+        }
+        _ => Ok(Cow::Borrowed(base)),
+    }
+}
+
+/// The destination-class axis whose `when` gate `unknown_f5_gate` sets.
+pub const A6: &str = "a6_destination_class";
 
 /// The request body: `{"state", "model", "questions"}`.
 pub fn request_body(state_text: &str, model: &str, questions: J) -> String {
@@ -151,8 +192,9 @@ pub fn judge(
     key: &Result<(Secret, KeySource), String>,
 ) -> JudgeRecord {
     let t0 = Instant::now();
-    let ctx = transcript::build(src);
-    let st = build_state(command, &ctx);
+    let limits = &s.tuning.context;
+    let ctx = transcript::build_with(src, limits);
+    let st = build_state_with(command, &ctx, limits);
     let mut rec = JudgeRecord {
         backend: "jev",
         level: ctx.level,
@@ -176,7 +218,8 @@ pub fn judge(
         error: None,
     };
     let result = (|| -> Result<(), String> {
-        let rubric = rubric::rubric()?;
+        let rubric = effective_rubric(&s.tuning)?;
+        let rubric: &Rubric = &rubric;
         rec.rubric_hash = rubric.hash.clone();
         let caps = ctx.level.capabilities();
         rec.questions_sent = rubric.axes_at(caps).map(|a| a.id.clone()).collect();
@@ -200,7 +243,11 @@ pub fn judge(
         }
         decide::check_complete(rubric, caps, &reply.response.answers)?;
         let sig = decide::signals(rubric, &reply.response.answers, caps);
-        let t = decide::tier(&sig);
+        let unavailable: Vec<decide::TierId> = decide::unavailable_tiers(rubric)
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        let t = decide::tier_with(&sig, &s.tuning, &unavailable);
         rec.signals = Some(sig);
         rec.tier = Some(t.name);
         rec.tier_rule = Some(t.rule);

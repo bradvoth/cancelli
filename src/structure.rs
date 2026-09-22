@@ -13,6 +13,7 @@ use serde::Serialize;
 use crate::fixes::Tags;
 use crate::py_re;
 use crate::pyre::basename;
+use crate::tunables::StructurePenalties;
 
 /// `_EXEC_INTERPRETERS` (structure.py:16-18).
 pub const EXEC_INTERPRETERS: &[&str] = &[
@@ -52,17 +53,19 @@ pub struct Structure {
 }
 
 impl Structure {
-    fn score(&mut self) {
+    /// The reference's first-match ladder (structure.py; paper App. A.1)
+    /// with tunable rung values (`care.structure`).
+    fn score(&mut self, p: &StructurePenalties) {
         self.structure_risk = if self.has_pipe_to_exec {
-            1.0
+            p.pipe_to_exec
         } else if self.has_eval {
-            0.9
+            p.eval
         } else if self.nested_sub_depth >= 2 {
-            0.6
+            p.nested_substitution
         } else if self.has_command_sub {
-            0.30
+            p.command_substitution
         } else if self.has_pipe {
-            0.05
+            p.pipe
         } else {
             0.0
         };
@@ -78,8 +81,13 @@ pub fn parse(src: &str) -> Result<ast::Program, String> {
     p.parse_program().map_err(|e| e.to_string())
 }
 
-/// Analyse one view.
+/// Analyse one view with the built-in penalties.
 pub fn analyze(view: usize, src: &str, tags: &mut Tags) -> Structure {
+    analyze_with(view, src, tags, &StructurePenalties::default())
+}
+
+/// Analyse one view with tunable penalties (`care.structure`).
+pub fn analyze_with(view: usize, src: &str, tags: &mut Tags, p: &StructurePenalties) -> Structure {
     let mut s = Structure {
         view,
         ..Structure::default()
@@ -93,11 +101,11 @@ pub fn analyze(view: usize, src: &str, tags: &mut Tags) -> Structure {
                 tags,
             };
             w.program(&prog, 0, false);
-            s.score();
+            s.score(p);
         }
         Err(e) => {
             s.parse_error = Some(e);
-            fallback(src, &mut s, tags);
+            fallback(src, &mut s, tags, p);
         }
     }
     s
@@ -115,7 +123,7 @@ py_re!(
 
 /// `_fallback` (structure.py:121-131) with FIX-005 (true nesting depth
 /// instead of a count) and FIX-013 (`| /bin/sh`).
-fn fallback(cmd: &str, s: &mut Structure, tags: &mut Tags) {
+fn fallback(cmd: &str, s: &mut Structure, tags: &mut Tags, p: &StructurePenalties) {
     s.atoms = vec![cmd.to_string()];
     s.has_pipe = cmd.contains('|');
     s.has_redirect = cmd.contains('>');
@@ -132,7 +140,7 @@ fn fallback(cmd: &str, s: &mut Structure, tags: &mut Tags) {
         tags.fix("FIX-005");
     }
     s.nested_sub_depth = depth;
-    s.score();
+    s.score(p);
 }
 
 /// Lexical nesting depth of `$( … )` / backtick substitutions.

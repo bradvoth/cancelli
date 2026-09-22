@@ -22,6 +22,9 @@ Research notes: `docs/research/care-paper-report.md`, `docs/research/care-repo-r
 | D15 | Jev failure | No key, timeout, transport or HTTP error, unparseable response, missing answers, or `response.model != "jev-1.13.0"` all produce **ask**, plus an error record in the log. |
 | D16 | Jev context | **L2 exactly as in the POC** render template (spec §3): proposed action; the user's request from genuine user prompts in the transcript; prior agent tool calls with args verbatim, clipped as in the POC; tool results **never** included (reasoning-blind). |
 | D17 | Jev in dry-run | **Called for real** on unresolved WARNs. The full request state, answers, tier, verdict, latency, usage and request-id are logged. No decision is emitted. |
+| D18 | CARE tunables (2026-09-22) | Scalars go in `config.toml` `[care]`: L5 layer weights; per-mode τlow/τhigh; θrule, θsem; provenance π per tier; H_sem class set; L2 class base scores; L1 structure penalties; L3 path tier scores. **Per-rule overrides** by SE-P id: `enabled`, `confidence`. Lexicons, path catalogs and regexes stay embedded. |
+| D19 | Jev tunables | `[jev]`: every tier threshold (a5 transport, a1/a7 sensitive, a6 unknown incl. its f5 gate, f5 deny/ask cut-offs, d1/b4), tier order, tier→verdict map, context limits (4,000 / 12,000 chars, max level). Also **`rubric_file`**, an alternative rubric YAML, validated at load with its rubric_hash logged. An invalid file falls back to the embedded rubric with an error record. Tiers referencing axes the rubric lacks can't fire, and produce a warning record. |
+| D20 | Tunable guardrails | Every default equals today's behaviour, so an empty config changes nothing, and the parity and fidelity tests run on defaults. Values are validated at load; an invalid value falls back to its default with an error record (fail open). Each log record carries `config_fingerprint`, a hash of the effective tunables, plus `overrides[]`, the keys that differ from default. `cancelli config` lists every tunable with its source. |
 | D8 | Crate structure | **Library + thin binary.** All logic (pipeline, hook I/O, logging, config) lives in the lib (`src/lib.rs` + modules); `src/main.rs` only parses CLI args and calls into the lib. |
 | D9 | Install | **`cargo install --path .`** → `~/.cargo/bin/cancelli`; the hook command is `cancelli hook --dry-run`. Nothing may depend on the source checkout at runtime (rules/prompt embedded via `include_str!`). |
 | D10 | Config | **`~/.config/cancelli/config.toml`** (`$XDG_CONFIG_HOME/cancelli/config.toml` if set; deliberately *not* macOS `~/Library/Application Support`). |
@@ -33,12 +36,11 @@ Precedence: CLI flag > env var > config file > built-in default. A missing file 
 ```toml
 mode = "balanced"          # strict | balanced | auto
 dry_run = true             # the --dry-run flag forces true
+decide_all = false         # D13; --decide-all forces true (top-level: must precede any [table])
 
 [log]
 dir = "~/.local/share/cancelli"   # env CANCELLI_LOG_DIR overrides
 max_field_bytes = 4096            # non-Bash string truncation threshold
-
-decide_all = false         # D13; --decide-all forces true
 
 [judge]
 backend = "jev"            # "jev" | "stub"
@@ -86,7 +88,7 @@ Not bugs (paper-faithful, kept, observable in dry-run data): everyday dev comman
 
 ## Log record (per PreToolUse)
 
-`ts, version, rules_version, session_id, tool_use_id, cwd, permission_mode, tool_name, mode, dry_run, latency_us` plus, for Bash: `command, views[], layers{L1,L2,L3,L4: score + evidence}, fired_rules[{id, tier, conf, pi, family}], aggregate, provisional{strict,balanced,auto}, skip_predicate, would_adjudicate, judge_prompt (when would_adjudicate), final, fixes_applied[], ext_applied[]`; for others: `tool_input` (truncated per above).
+`ts, version, rules_version, session_id, tool_use_id, cwd, permission_mode, tool_name, mode, dry_run, latency_us` plus, for Bash: `command, views[], layers{L1,L2,L3,L4: score + evidence}, fired_rules[{id, tier, conf, pi, family}], aggregate, provisional{strict,balanced,auto}, skip_predicate, would_adjudicate, judge_prompt (when would_adjudicate), final, fixes_applied[], ext_applied[]`; for others: `tool_input` (truncated per above). Every record also carries `config_fingerprint`, `overrides[]` and `rubric_hash` (D20).
 
 ## Testing
 

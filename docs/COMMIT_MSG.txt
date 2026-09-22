@@ -1,75 +1,76 @@
-Adjudicate CARE WARNs with Jev (jev-1.13.0) instead of the stub
+Expose CARE and Jev tunables in config.toml (D18-D20)
 
-Replaces the stubbed WARN judge with Jev, TypeSafe AI's hosted rubric model,
-as ported from the jev_gate POC (decisions D11-D17). Only Bash commands CARE
-leaves at WARN with no skip predicate reach Jev; CARE's static ALLOW and DENY
-are unchanged (D12).
+Every numeric knob of CARE and of the Jev adjudicator can now be set in
+config.toml. Lexicons, path catalogs and regexes stay embedded. The
+defaults reproduce the previous constants exactly, so an empty or absent
+config changes nothing.
 
-Context (D16): the proposed action (`tool: bash`, args = the command), the
-user request from genuine human prompts in the session transcript (a
-documented, unit-tested filter drops tool results, isMeta/compact-summary/
-sidechain records, system reminders, task notifications, local-command
-output and inter-session messages), and prior tool_use calls with args
-verbatim. Tool results and agent prose are never read. The level degrades
-from L2 to L1/L0 when the transcript is missing or does not yet contain the
-current tool_use, and the achieved level is logged. The state uses the POC
-render template byte-for-byte: same headers, 4,000-char clipping,
-12,000-char history budget, decoded-forms section, results never rendered.
+[care] (D18): L5 weights; tau_low/tau_high for each mode; theta_rule,
+theta_sem and the H_sem class set; provenance pi per tier; the 10 L2 class
+base scores; the 5 L1 ladder values; the 8 L3 tier scores. Per-rule
+overrides by SE-P id: `enabled = false` removes a rule from L4 matching and
+from p_rule, and `confidence` feeds both L4 (pi*conf) and p_rule.
 
-Rubric: data/jev/v1_policy_distilled.yaml vendored verbatim via
-include_str!. All 40 axes are parsed, and per-level question selection
-applies `requires` (L0/L1 38, L2 39). A test recomputes rubric_hash with the
-POC's exact algorithm (Python json.dumps separators, sort_keys,
-ensure_ascii=False) and asserts 0fd1f245ae1c7ef3.
+[jev] (D19): the tier thresholds (a5 transport, a1/a7 sensitive, a6
+unknown and its f5 gate, f5 deny/ask, d1 obfuscated, b4 irreversible),
+the first-match tier order, the T1..T6 -> allow|ask|deny map, and the
+context limits (4,000-char clip, 12,000-char history budget, max level
+L0/L1/L2). `rubric_file` loads an alternative rubric YAML with the same
+parser and lint as the embedded one. Its rubric_hash is logged and is the
+hash in the judge record. An unreadable or invalid file falls back to the
+embedded rubric with an error record. A tier that reads an axis the rubric
+lacks can never fire, and each one produces a warning record.
 
-Decision (D14): the POC's signals() with the rubric's declarations, then the
-6-tier first-match rules of the spec, thresholds unchanged. "unknown" is the
-declared a6 argmax predicate, gated on f5 > 0.8. T1/T2 -> deny, T3-T5 -> ask,
-T6 -> allow. A Jev allow emits nothing unless --decide-all / decide_all =
-true (D13). Every failure -> ask plus an error record (D15): no key, key file
-with group/other permissions, transport error, timeout, non-2xx,
-unparseable body, missing answers, or response.model != jev-1.13.0.
+Guardrails (D20): values are validated one at a time. Weights must be
+finite and >= 0, probabilities and thresholds in [0,1], tau_low < tau_high,
+and class names, tier names and SE-P ids must be known. An invalid value
+falls back to its own default with an error record naming the key, and
+unknown keys produce warnings. The hook still fails open. Every log record
+now carries `config_fingerprint`, a 16-hex sha256 of the canonical JSON of
+the effective tunables (independent of key order and spelling), plus
+`overrides[]` (the dotted keys that differ from the default) and
+`rubric_hash`. `cancelli config` lists every tunable with its value and
+source, and the effective enabled/confidence of all 139 rules.
+`cancelli config --init` appends every tunable at its default, each with a
+one-line explanation and its provenance (paper eq., repo file or FINDINGS
+section), all commented out.
 
-Transport: blocking ureq 3 + rustls, POST {base_url}/v1/systemone with a
-Bearer key (env var named by api_key_env, else a 0600 api_key_file; never
-logged, redacted from errors). 3,000 ms per request, 5,000 ms budget, one
-retry on 408/429/5xx/timeout honouring retry-after(-ms) within the budget.
-Captures x-typesafe-request-id and usage. Dry-run calls Jev for real and
-logs the full judge record (D17); `cancelli judge "<cmd>" [--transcript]
-[--request]` prints the same record; `cancelli config` shows the new keys,
-their sources, and where the key was found.
+The values are threaded through the engine and Jev as a `Tunables` struct
+(src/tunables.rs; `Options.care`, `jev::Settings.tuning`), not globals.
+Tier predicate text in the judge record (`tier_rule`) shows the thresholds
+in force.
 
-Also fixes Env::from_process() to skip non-UTF-8 environment variables, so
-one of them can no longer panic the hook before its panic guard.
+Tests: the parity suite, the Jev fidelity/offline tests, the smoke replays
+and every pre-existing e2e test pass unchanged on defaults. A golden
+snapshot (tests/golden/tunables_default.json, fingerprint e1b0fc1e6d5d91ad)
+pins Tunables::default(). tests/tuning_e2e.rs drives the real binary with a
+temp HOME and XDG_CONFIG_HOME and shows that each group changes the
+outcome:
+- lowering balanced tau_high turns the rsync WARN into DENY;
+- disabling SE-P-103 drops it from fired_rules and gives ALLOW;
+- raising gtfobins pi makes p_rule fire on a GTFOBins shell;
+- mapping T5 to deny changes the enforce output from ask to deny on the
+  replayed POC fixture;
+- a smaller history budget, a field clip and max_level change the rendered
+  state;
+- a rubric_file with a renamed axis warns, and T2/T5 never fire.
+It also checks that invalid values fall back per key with an error record,
+exit 0 and silent dry-run. The fingerprint is stable across layouts, and
+overrides[] lists exactly the changed keys. `config --init` pins nothing,
+and uncommenting it reproduces the defaults. The README table is checked
+against the code.
 
-Tests: the 8 POC smoke-gate states render and hash byte-identically to the
-POC. The POC's real cached responses for them (8 files, screened for
-credentials) replay to the POC's own signals, tiers T6/T2/T6/T2/T6/T2/T6/T5,
-and all 10 smoke checks. The real binary is exercised against a local
-stand-in server for connection refused, hang/timeout, missing key, loose key
-file, wrong model, 503-then-ok and 401 (each: ask, error record, exit 0 in
-dry-run), and for decide_all on/off in enforce mode. The exact request on
-the wire is asserted, and so is the absence of any key, result, prose or
-system-reminder leak. tests/jev_live.rs (ignored) runs the smoke gate and
-one WARN through an installed binary against the real API:
-TYPESAFE_API_KEY=... cargo test --test jev_live -- --ignored
+Docs: README "Tuning" (all tunables with default, meaning and provenance;
+examples; calibrating from logs by fingerprint and overrides; a caution
+that the Jev thresholds were calibrated on the embedded rubric and on the
+ProCreations corpus) and a constant inventory listing what stays embedded
+and why.
 
-Behaviour change: an unresolved WARN is now `final = "ask"` when Jev fails
-(including with no key) instead of `unadjudicated`; the e2e expectation is
-updated accordingly. backend = "stub" restores the old behaviour.
-
-Deviations from the POC (README "Deviations from the POC"):
-
-JEV-DEV-001 user_request keeps the most recent prompt (POC keeps the oldest 4,000 chars).
-JEV-DEV-002 tool results are never read, so the history budget counts call text only.
-JEV-DEV-003 3 s / 5 s budget / one retry, failures ask (POC: SDK 60 s, 2 retries, 30 s).
-JEV-DEV-004 no answer cache.
-
-CARE divergences carried forward: FIX-004 (first-token parsing) and FIX-008
-(judge timeout) now apply to text judges; Jev's backstop timeout asks.
-Unchanged: FIX-001, FIX-002, FIX-003, FIX-005, FIX-006, FIX-007, FIX-009,
-FIX-010, FIX-011, FIX-012, FIX-013, EXT-001, EXT-002, EXT-003, EXT-004,
-EXT-005, EXT-006.
+Unchanged: FIX-001, FIX-002, FIX-003, FIX-004, FIX-005, FIX-006, FIX-007,
+FIX-008, FIX-009, FIX-010, FIX-011, FIX-012, FIX-013, EXT-001, EXT-002,
+EXT-003, EXT-004, EXT-005, EXT-006, and the Jev deviations JEV-DEV-001,
+JEV-DEV-002, JEV-DEV-003, JEV-DEV-004 (the budget JEV-DEV-002 describes is
+now `jev.context.history_chars`).
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_015U3NJZXHn92Yg7zAHDKRza

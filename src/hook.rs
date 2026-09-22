@@ -47,6 +47,13 @@ fn base_record(kind: &str, loaded: &Loaded) -> Map<String, Value> {
     );
     m.insert("mode".into(), json!(loaded.config.mode.as_str()));
     m.insert("dry_run".into(), json!(loaded.config.dry_run));
+    // D20: which tunables produced this record.
+    m.insert("config_fingerprint".into(), json!(loaded.fingerprint));
+    m.insert("overrides".into(), json!(loaded.overrides));
+    m.insert(
+        "rubric_hash".into(),
+        json!(loaded.config.tunables.jev.rubric_hash()),
+    );
     m
 }
 
@@ -110,6 +117,7 @@ pub fn jev_settings(c: &Config) -> jev::Settings {
         },
         model: c.judge_model.clone(),
         decide_all: c.decide_all,
+        tuning: c.tunables.jev.clone(),
     }
 }
 
@@ -159,7 +167,7 @@ pub fn decision_output(a: &Analysis, decide_all: bool) -> Option<Value> {
     };
     if let Some(j) = a.judge.as_ref().and_then(|o| o.jev.as_ref()) {
         let care = format!("CARE WARN score {}, rules {}", a.aggregate, rules);
-        let why = match (&j.error, j.tier, j.tier_rule) {
+        let why = match (&j.error, j.tier, j.tier_rule.as_deref()) {
             (Some(e), _, _) => format!("Jev unavailable ({e})"),
             (None, Some(t), Some(rule)) => format!("Jev {t}: {rule}"),
             _ => "Jev".to_string(),
@@ -282,6 +290,7 @@ pub fn run(stdin: &[u8], args: &HookArgs, env: &Env) -> HookOutput {
             home: env.home.clone().unwrap_or_default(),
             adjudicator,
             judge_timeout,
+            care: loaded.config.tunables.care.clone(),
         };
         match engine::analyze(cmd, &opts) {
             Err(e) => {

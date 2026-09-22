@@ -14,10 +14,11 @@ use sha2::{Digest, Sha256};
 
 use super::pyjson::{J, py_dumps_sorted};
 use crate::canon::b64decode_strict;
+use crate::tunables::ContextLimits;
 
-/// `MAX_FIELD_CHARS`.
+/// `MAX_FIELD_CHARS` (default of `jev.context.field_chars`).
 pub const MAX_FIELD_CHARS: usize = 4000;
-/// `MAX_PRIOR_CHARS`.
+/// `MAX_PRIOR_CHARS` (default of `jev.context.history_chars`).
 pub const MAX_PRIOR_CHARS: usize = 12_000;
 
 /// Context level (`jev_gate/context.py::ContextLevel`).
@@ -53,6 +54,23 @@ impl Level {
     fn includes_prior_actions(self) -> bool {
         self >= Level::L2
     }
+    /// Short name (`L0`..`L3`), as used in `jev.context.max_level`.
+    pub fn short(self) -> &'static str {
+        match self {
+            Level::L0 => "L0",
+            Level::L1 => "L1",
+            Level::L2 => "L2",
+            Level::L3 => "L3",
+        }
+    }
+
+    /// Parse a short name or the POC value (`L1` / `l1_request`).
+    pub fn parse(s: &str) -> Option<Level> {
+        [Level::L0, Level::L1, Level::L2, Level::L3]
+            .into_iter()
+            .find(|l| l.short() == s || l.value() == s)
+    }
+
     /// Evidence present at this level, for `requires:` gating.
     pub fn capabilities(self) -> &'static [&'static str] {
         match self {
@@ -151,7 +169,12 @@ pub fn args_text(args: &Value) -> String {
 
 /// `_call_text`: `tool(clip(args_text))`.
 pub fn call_text(tool: &str, args: &Value) -> String {
-    format!("{tool}({})", clip(&args_text(args), MAX_FIELD_CHARS))
+    call_text_with(tool, args, MAX_FIELD_CHARS)
+}
+
+/// [`call_text`] with a tunable clip (`jev.context.field_chars`).
+pub fn call_text_with(tool: &str, args: &Value, field_chars: usize) -> String {
+    format!("{tool}({})", clip(&args_text(args), field_chars))
 }
 
 fn printable_ratio(data: &[u8]) -> f64 {
@@ -246,10 +269,12 @@ pub struct State {
     pub decoded: Decoded,
     /// Context level.
     pub level: Level,
+    /// History budget in characters ([`MAX_PRIOR_CHARS`] by default).
+    pub history_chars: usize,
 }
 
 impl State {
-    /// `fitted_turns`: newest-first under [`MAX_PRIOR_CHARS`] (results count
+    /// `fitted_turns`: newest-first under the history budget (results count
     /// toward the budget even where not rendered; the newest turn is always
     /// kept), returned oldest-first.
     pub fn fitted_turns(&self) -> Vec<&PriorTurn> {
@@ -257,7 +282,7 @@ impl State {
         let mut used = 0usize;
         for t in self.prior_turns.iter().rev() {
             let cost = py_len(&t.call_text) + py_len(&t.result_text) + 8;
-            if !kept.is_empty() && used + cost > MAX_PRIOR_CHARS {
+            if !kept.is_empty() && used + cost > self.history_chars {
                 break;
             }
             used += cost;
@@ -382,10 +407,30 @@ pub fn state_from_shell_command(
     prior_results: &[String],
     level: Level,
 ) -> State {
+    state_from_shell_command_with(
+        command,
+        user_request,
+        prior_actions,
+        prior_results,
+        level,
+        &ContextLimits::default(),
+    )
+}
+
+/// [`state_from_shell_command`] with tunable clip and history budget
+/// (`jev.context`).
+pub fn state_from_shell_command_with(
+    command: &str,
+    user_request: &str,
+    prior_actions: &[String],
+    prior_results: &[String],
+    level: Level,
+    limits: &ContextLimits,
+) -> State {
     State {
         tool: "bash".into(),
-        args: clip(command, MAX_FIELD_CHARS),
-        user_request: clip(user_request, MAX_FIELD_CHARS),
+        args: clip(command, limits.field_chars),
+        user_request: clip(user_request, limits.field_chars),
         prior_turns: prior_actions
             .iter()
             .enumerate()
@@ -396,6 +441,7 @@ pub fn state_from_shell_command(
             .collect(),
         decoded: decode_payloads(command),
         level,
+        history_chars: limits.history_chars,
     }
 }
 
@@ -486,5 +532,26 @@ mod tests {
             call_text("bash", &Value::String("ls -la".into())),
             "bash(ls -la)"
         );
+    }
+
+    #[test]
+    fn history_budget_is_tunable() {
+        let prior: Vec<String> = (0..3).map(|i| format!("bash(step {i})")).collect();
+        let st = state_from_shell_command("ls", "req", &prior, &[], Level::L2);
+        assert_eq!(st.history_chars, MAX_PRIOR_CHARS);
+        assert_eq!(st.fitted_turns().len(), 3);
+        let lim = ContextLimits {
+            history_chars: 20,
+            ..ContextLimits::default()
+        };
+        let st2 = state_from_shell_command_with("ls", "req", &prior, &[], Level::L2, &lim);
+        let kept: Vec<&str> = st2
+            .fitted_turns()
+            .iter()
+            .map(|t| t.call_text.as_str())
+            .collect();
+        assert_eq!(kept, vec!["bash(step 2)"]);
+        assert!(st2.render().ends_with("[1] bash(step 2)"));
+        assert_ne!(st.state_hash(), st2.state_hash());
     }
 }

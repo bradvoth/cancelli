@@ -2,6 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::tunables::{Band, Modes, Weights};
+
 /// Aggregation weights (paper App. A.5; policy.py:15-18).
 pub const W_SEM: f64 = 0.30;
 /// Path weight.
@@ -80,12 +82,22 @@ impl Verdict {
 /// Eq. 6, evaluated in the reference's operand order so results are
 /// bit-identical to Python.
 pub fn compose(sem: f64, path: f64, pat: f64, strukt: f64) -> f64 {
-    W_SEM * sem + W_PATH * path + W_PAT * pat + W_STRUCT * strukt
+    compose_with(&Weights::default(), sem, path, pat, strukt)
+}
+
+/// Eq. 6 with tunable weights (`care.weights`), same operand order.
+pub fn compose_with(w: &Weights, sem: f64, path: f64, pat: f64, strukt: f64) -> f64 {
+    w.sem * sem + w.path * path + w.pat * pat + w.r#struct * strukt
 }
 
 /// Eq. 7.
 pub fn decide(score: f64, mode: Mode) -> Verdict {
-    let (lo, hi) = mode.thresholds();
+    decide_band(score, Band::of(mode))
+}
+
+/// Eq. 7 with tunable thresholds (`care.modes.<mode>`).
+pub fn decide_band(score: f64, band: Band) -> Verdict {
+    let (lo, hi) = (band.tau_low, band.tau_high);
     if score < lo {
         Verdict::Allow
     } else if score < hi {
@@ -109,10 +121,15 @@ pub struct Provisional {
 impl Provisional {
     /// Decide under every mode.
     pub fn of(score: f64) -> Self {
+        Provisional::of_with(score, &Modes::default())
+    }
+
+    /// Decide under every mode with tunable thresholds.
+    pub fn of_with(score: f64, m: &Modes) -> Self {
         Provisional {
-            strict: decide(score, Mode::Strict),
-            balanced: decide(score, Mode::Balanced),
-            auto: decide(score, Mode::Auto),
+            strict: decide_band(score, m.strict),
+            balanced: decide_band(score, m.balanced),
+            auto: decide_band(score, m.auto),
         }
     }
 

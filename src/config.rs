@@ -13,6 +13,7 @@ use serde::Serialize;
 
 use crate::jev::client::{self, KeySource, PINNED_MODEL, Secret};
 use crate::policy::Mode;
+use crate::tunables::{self, Tunables};
 
 /// A snapshot of environment variables whose `Debug` never shows values
 /// (it may hold the API key).
@@ -124,6 +125,9 @@ pub struct Config {
     pub judge_timeout_ms: u64,
     /// Total budget in ms (including one retry).
     pub judge_budget_ms: u64,
+    /// `[care]` and `[jev]` tunables (D18-D20).
+    #[serde(skip)]
+    pub tunables: Tunables,
 }
 
 impl Config {
@@ -159,6 +163,22 @@ pub struct Loaded {
     pub file_found: bool,
     /// Load diagnostics.
     pub diagnostics: Vec<Diagnostic>,
+    /// Tunable keys set (validly) in the file.
+    pub tunables_from_file: std::collections::BTreeSet<String>,
+    /// `config_fingerprint` of the effective tunables.
+    pub fingerprint: String,
+    /// `overrides[]`: tunable keys that differ from the default.
+    pub overrides: Vec<String>,
+}
+
+impl Loaded {
+    /// The tunables view for rendering.
+    pub fn tunables_loaded(&self) -> tunables::Loaded {
+        tunables::Loaded {
+            tunables: self.config.tunables.clone(),
+            from_file: self.tunables_from_file.clone(),
+        }
+    }
 }
 
 /// CLI overrides.
@@ -197,6 +217,12 @@ timeout_ms = 3000          # per request
 budget_ms = 5000           # total incl. one retry on 408/429/5xx/timeout; keep well under the hook timeout
 "#;
 
+/// The whole file `cancelli config --init` writes: [`DEFAULT_FILE`] plus
+/// every tunable, commented out ([`tunables::init_template`]).
+pub fn default_file() -> String {
+    format!("{DEFAULT_FILE}{}", tunables::init_template())
+}
+
 /// Default Jev base URL.
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 
@@ -231,7 +257,18 @@ pub fn expand_tilde(p: &str, env: &Env) -> PathBuf {
 }
 
 const KNOWN: &[(&str, &[&str])] = &[
-    ("", &["mode", "dry_run", "decide_all", "log", "judge"]),
+    (
+        "",
+        &[
+            "mode",
+            "dry_run",
+            "decide_all",
+            "log",
+            "judge",
+            "care",
+            "jev",
+        ],
+    ),
     ("log", &["dir", "max_field_bytes"]),
     (
         "judge",
@@ -282,6 +319,7 @@ pub fn load(env: &Env, cli: &CliOverrides) -> Loaded {
 
     let path = config_path(env);
     let mut file_found = false;
+    let mut root: Option<toml::Table> = None;
     if let Some(p) = &path {
         match std::fs::read_to_string(p) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -297,6 +335,7 @@ pub fn load(env: &Env, cli: &CliOverrides) -> Loaded {
                         message: format!("invalid TOML in {}: {e}; using defaults", p.display()),
                     }),
                     Ok(table) => {
+                        root = Some(table.clone());
                         let mut f = FileValues::default();
                         match f.read(&table, &mut diags) {
                             Ok(()) => {
@@ -413,6 +452,12 @@ pub fn load(env: &Env, cli: &CliOverrides) -> Loaded {
         });
     }
 
+    // Tunables are validated key by key (D20), independently of the keys
+    // above: a bad `mode` does not reset them, nor they it.
+    let tl = tunables::load(root.as_ref(), env, &mut diags);
+    let fingerprint = tl.tunables.fingerprint();
+    let overrides = tl.tunables.overrides();
+
     Loaded {
         config: Config {
             mode,
@@ -429,11 +474,15 @@ pub fn load(env: &Env, cli: &CliOverrides) -> Loaded {
                 .or_else(|| default_key_file(env)),
             judge_timeout_ms: timeout_ms,
             judge_budget_ms: budget_ms,
+            tunables: tl.tunables,
         },
         sources,
         path,
         file_found,
         diagnostics: diags,
+        tunables_from_file: tl.from_file,
+        fingerprint,
+        overrides,
     }
 }
 
@@ -646,6 +695,7 @@ pub fn render(l: &Loaded, env: &Env) -> String {
         Ok((_, from)) => format!("# judge api key: found ({from})\n"),
         Err(e) => format!("# judge api key: {e}\n"),
     });
+    out.push_str(&tunables::render(&l.tunables_loaded()));
     for d in &l.diagnostics {
         out.push_str(&format!("# {}: {}\n", d.level, d.message));
     }
@@ -666,7 +716,7 @@ pub fn init(env: &Env) -> Result<PathBuf, String> {
         .create_new(true)
         .open(&p)
         .map_err(|e| format!("create {}: {e}", p.display()))?;
-    std::io::Write::write_all(&mut f, DEFAULT_FILE.as_bytes())
+    std::io::Write::write_all(&mut f, default_file().as_bytes())
         .map_err(|e| format!("write {}: {e}", p.display()))?;
     Ok(p)
 }
@@ -789,7 +839,9 @@ mod tests {
         let l = load(&env, &CliOverrides::default());
         assert!(l.file_found);
         assert!(l.diagnostics.is_empty(), "{:?}", l.diagnostics);
-        assert_eq!(std::fs::read_to_string(p).unwrap(), DEFAULT_FILE);
+        assert_eq!(std::fs::read_to_string(p).unwrap(), default_file());
+        assert!(l.overrides.is_empty());
+        assert_eq!(l.fingerprint, Tunables::default().fingerprint());
     }
 
     #[test]

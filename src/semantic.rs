@@ -6,6 +6,7 @@ use serde::Serialize;
 use crate::fixes::Tags;
 use crate::py_re;
 use crate::pyre::{basename, py_split};
+use crate::tunables::ClassBase;
 
 /// L2 risk classes (common.py:13-24).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -34,7 +35,36 @@ pub enum RiskClass {
 }
 
 impl RiskClass {
-    /// `CLASS_BASE_SCORE` (common.py:28-39).
+    /// Every class, in enum order (the order of `care.class_base` and of the
+    /// canonical `care.resolution.h_sem`).
+    pub const ALL: [RiskClass; 10] = [
+        RiskClass::ReadOnly,
+        RiskClass::WriteLocal,
+        RiskClass::WriteSensitive,
+        RiskClass::NetworkFetch,
+        RiskClass::ExecutionChain,
+        RiskClass::PrivilegeOrPermission,
+        RiskClass::Persistence,
+        RiskClass::Destructive,
+        RiskClass::ResourceAbuse,
+        RiskClass::Unknown,
+    ];
+
+    /// Position in [`RiskClass::ALL`].
+    pub fn index(self) -> usize {
+        RiskClass::ALL
+            .iter()
+            .position(|c| *c == self)
+            .unwrap_or_default()
+    }
+
+    /// Parse a reference class name (`DESTRUCTIVE`, …).
+    pub fn parse(name: &str) -> Option<RiskClass> {
+        RiskClass::ALL.iter().copied().find(|c| c.as_str() == name)
+    }
+
+    /// Built-in `CLASS_BASE_SCORE` (common.py:28-39); the default of
+    /// `care.class_base`.
     pub fn base(self) -> f64 {
         match self {
             RiskClass::ReadOnly => 0.00,
@@ -367,15 +397,23 @@ fn c(class: RiskClass, score: f64, reason: impl Into<String>) -> Classification 
     }
 }
 
-/// `SemanticClassifier.classify` (semantic.py:133-186).
+/// `SemanticClassifier.classify` (semantic.py:133-186) with the built-in
+/// class base scores.
 pub fn classify(atom: &str, tags: &mut Tags) -> Classification {
+    classify_with(atom, tags, &ClassBase::default())
+}
+
+/// [`classify`] with tunable class base scores (`care.class_base`). The
+/// special-case scores (`rm_rf`, `git_push_force`, `chmod_777`, …) are part
+/// of the embedded lexicon and are not tunable.
+pub fn classify_with(atom: &str, tags: &mut Tags, base: &ClassBase) -> Classification {
     let tokens = py_split(atom);
     let Some(first) = tokens.first() else {
         return c(ReadOnly, 0.0, "empty");
     };
     let prog = basename(first);
     if prog == "git" && tokens.len() > 1 {
-        return classify_git(&tokens, tags);
+        return classify_git(&tokens, tags, base);
     }
     if prog == "rm" {
         return classify_rm(&tokens);
@@ -387,33 +425,33 @@ pub fn classify(atom: &str, tags: &mut Tags) -> Classification {
         return classify_dd(&tokens);
     }
     if prog == "sed" && tokens.iter().any(|t| t.starts_with("-i")) {
-        return c(WriteLocal, WriteLocal.base(), "sed_inplace");
+        return c(WriteLocal, base.get(WriteLocal), "sed_inplace");
     }
     if prog == "docker" || prog == "podman" {
-        return classify_docker(&tokens);
+        return classify_docker(&tokens, base);
     }
     if matches!(prog, "kill" | "pkill" | "killall") {
-        return classify_kill(&tokens);
+        return classify_kill(&tokens, base);
     }
     let cls = lookup(prog);
     if touches_secret_path(&tokens) && matches!(cls, WriteLocal | ReadOnly) {
         return c(
             WriteSensitive,
-            WriteSensitive.base(),
+            base.get(WriteSensitive),
             format!("{prog}:secret_path"),
         );
     }
     if matches!(prog, "rsync" | "scp" | "sftp") && !has_remote_host(&tokens) {
         return c(
             WriteLocal,
-            WriteLocal.base(),
+            base.get(WriteLocal),
             format!("{prog}:local_no_remote_host"),
         );
     }
-    c(cls, cls.base(), format!("db_lookup:{prog}"))
+    c(cls, base.get(cls), format!("db_lookup:{prog}"))
 }
 
-fn classify_git(tokens: &[&str], tags: &mut Tags) -> Classification {
+fn classify_git(tokens: &[&str], tags: &mut Tags, base: &ClassBase) -> Classification {
     let sub = tokens.get(1).copied().unwrap_or("");
     let mut cls = git_sub_class(sub);
     if sub == "push"
@@ -438,7 +476,7 @@ fn classify_git(tokens: &[&str], tags: &mut Tags) -> Classification {
         cls = ReadOnly;
         tags.fix("FIX-009");
     }
-    c(cls, cls.base(), format!("git_{sub}"))
+    c(cls, base.get(cls), format!("git_{sub}"))
 }
 
 fn classify_rm(tokens: &[&str]) -> Classification {
@@ -524,7 +562,7 @@ fn classify_dd(tokens: &[&str]) -> Classification {
     c(Destructive, 0.6, "dd_generic")
 }
 
-fn classify_docker(tokens: &[&str]) -> Classification {
+fn classify_docker(tokens: &[&str], base: &ClassBase) -> Classification {
     if tokens.contains(&"run") && tokens.contains(&"--privileged") {
         return c(PrivilegeOrPermission, 0.90, "docker_privileged");
     }
@@ -534,14 +572,14 @@ fn classify_docker(tokens: &[&str]) -> Classification {
     {
         return c(ReadOnly, 0.0, "docker_read");
     }
-    c(WriteLocal, WriteLocal.base(), "docker_other")
+    c(WriteLocal, base.get(WriteLocal), "docker_other")
 }
 
 py_re!(re_kill_init, r"\bkill\s+-9?\s+(-?1|\$\$)\b");
 py_re!(re_killall_crit, r"\bkillall\s+(sshd|init|systemd|dbus)\b");
 py_re!(re_pkill_root, r"\bpkill\s+-9\s+-u\s+root\b");
 
-fn classify_kill(tokens: &[&str]) -> Classification {
+fn classify_kill(tokens: &[&str], base: &ClassBase) -> Classification {
     let joined = tokens.join(" ");
     if re_kill_init().is_match(&joined) {
         return c(ResourceAbuse, 0.95, "kill_init");
@@ -552,7 +590,7 @@ fn classify_kill(tokens: &[&str]) -> Classification {
     if re_pkill_root().is_match(&joined) {
         return c(ResourceAbuse, 0.90, "pkill_root");
     }
-    c(ResourceAbuse, ResourceAbuse.base(), "kill_generic")
+    c(ResourceAbuse, base.get(ResourceAbuse), "kill_generic")
 }
 
 fn touches_secret_path(tokens: &[&str]) -> bool {

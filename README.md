@@ -127,7 +127,8 @@ missing file means defaults; an unreadable or invalid file means defaults
 plus an `error` log record; unknown keys produce `warning` records.
 `cancelli config` prints the effective values and where each came from;
 `cancelli config --init` writes a commented default file (and refuses to
-overwrite one).
+overwrite one), including every `[care]`/`[jev]` tunable commented out (see
+[Tuning](#tuning)).
 
 ```toml
 mode = "balanced"          # strict | balanced | auto   (env CANCELLI_MODE)
@@ -155,6 +156,232 @@ ignored with a warning). `cancelli config` lists every key with its source
 never the key itself. `backend = "stub"` restores the pre-Jev behaviour (WARN
 → `unadjudicated`).
 
+## Tuning
+
+Every numeric knob of CARE and of the Jev adjudicator can be set in
+`config.toml`, under `[care]` (decision D18) and `[jev]` (D19). Lexicons, path
+catalogs and regexes stay embedded. The guardrails (D20):
+
+- **Defaults are today's behaviour.** An empty or absent config changes
+  nothing. The parity suite, the Jev fidelity/offline tests and the smoke
+  replays run on the defaults, and `tests/golden/tunables_default.json` pins
+  the default values (and their fingerprint, `e1b0fc1e6d5d91ad`), so any
+  drift of a default fails a test.
+- **Validated per key, fail open.** Weights must be finite and ≥ 0.
+  Probabilities, scores and thresholds must be in [0, 1], and
+  τ_low < τ_high for each mode. Class names, tier names and verdicts must be
+  known, and SE-P ids must be well-formed and exist in the bank. An invalid
+  value falls back to *its own* default (not the whole section), with an
+  `error` record naming the key. Unknown keys produce `warning` records. The
+  hook still exits 0 and, in dry-run, prints nothing. Tunables are validated
+  independently of the older top-level keys: a bad `mode` does not reset
+  them, and a bad tunable does not reset `mode`.
+- **Traceable.** Every log record carries `config_fingerprint`, a 16-hex
+  sha256 of the canonical JSON of the effective tunables (sorted keys,
+  shortest round-trip floats, so independent of key order, `1` vs `1.0` and
+  file layout), and `overrides[]`, the dotted keys whose effective value
+  differs from the default. It also carries `rubric_hash`, the hash of the
+  rubric in use. A value set to its default is not an override.
+- **Discoverable.** `cancelli config` lists every tunable with its value and
+  source (`default`/`file`), then the effective `enabled`/`confidence` of all
+  139 rules. `cancelli config --init` appends every tunable to the file at
+  its default, each with a one-line explanation and its provenance, all
+  commented out. The file documents the knobs without pinning them.
+
+Precedence is unchanged (CLI > env > file > default); tunables exist only
+in the file.
+
+### Examples
+
+```toml
+[care.modes.balanced]
+tau_high = 0.30            # rsync -avz ./data user@host:/backup/ (0.345): WARN -> DENY
+
+[care.provenance]
+gtfobins = 0.90            # π·conf 0.90·0.90 = 0.81 >= θ_rule: GTFOBins shells skip the judge (p_rule)
+
+[care.rules."SE-P-103"]    # cross-host file transfer
+enabled = false            # rsync/scp to user@host no longer fire L4 (0.345 -> 0.12, ALLOW)
+
+[care.rules]
+"SE-P-013" = { confidence = 0.60 }   # inline-table form of the same thing
+
+[jev.verdicts]
+T5 = "deny"                # f5_exceeds_approval > 0.5 now denies instead of asking
+
+[jev.tiers]
+order = ["T1", "T3", "T4", "T5", "T2"]   # first match; a tier left out never fires
+
+[jev.context]
+history_chars = 6000       # smaller prior-actions budget (newest call always kept)
+max_level = "L1"           # never send prior tool calls
+
+[jev]
+rubric_file = "~/rubrics/my_rubric.yaml"
+```
+
+`rubric_file` loads an alternative rubric YAML with the same parser and lint
+as the embedded one. A `warning` record names it and its `rubric_hash`. The
+judge record's `rubric_hash`, every record's `rubric_hash` and the
+fingerprint all use the hash of the rubric actually in use. An unreadable or
+invalid file falls back to the embedded rubric with an `error` record. A tier
+whose predicate reads an axis the loaded rubric lacks can never fire, and
+each such tier produces a `warning` record (for example, renaming
+`f5_exceeds_approval` disables T2 and T5). `jev.thresholds.unknown_f5_gate`
+sets a6's `when.over` whichever rubric is loaded, with a warning if the file
+declares a different gate. `when` is not part of the rubric hash or of the
+wire questions.
+
+> **Caution.** The Jev tier thresholds, the tier order and the verdict map
+> were calibrated on the **embedded rubric** (`0fd1f245ae1c7ef3`) and on the
+> **ProCreations corpus** (synthetic, LLM-generated; FINDINGS §5, spec §4.2).
+> They have not been calibrated on Claude Code traffic. Changing a
+> threshold, or loading another rubric, moves you off the measured purities
+> in the tier table above. Treat any change as a hypothesis to check against
+> your own dry-run logs.
+
+### Calibrating from the logs
+
+Because every record carries `config_fingerprint` and `overrides[]`, runs
+under different settings can be separated and compared after the fact:
+
+```sh
+# how outcomes split per configuration
+jq -r 'select(.kind=="event" and .command) | [.config_fingerprint, (.overrides|join(",")), .final] | @tsv' \
+  ~/.local/share/cancelli/events-*.jsonl | sort | uniq -c
+
+# Jev tiers per rubric and configuration
+jq -r 'select(.judge.backend=="jev") | [.rubric_hash, .config_fingerprint, .judge.tier, .judge.verdict] | @tsv' \
+  ~/.local/share/cancelli/events-*.jsonl | sort | uniq -c
+```
+
+```sql
+-- DuckDB: WARN-band share per configuration
+SELECT config_fingerprint, overrides,
+       avg(CASE WHEN provisional.balanced = 'WARN' THEN 1 ELSE 0 END) AS warn_rate,
+       count(*) AS n
+FROM read_json_auto('~/.local/share/cancelli/events-*.jsonl')
+WHERE kind = 'event' AND command IS NOT NULL
+GROUP BY ALL ORDER BY n DESC;
+```
+
+The scores are logged in full (`layers`, `scores`, `aggregate`,
+`judge.signals`), so a proposed threshold can also be replayed offline over
+logs taken under the defaults before you change the config.
+
+### Tunables
+
+All keys, their defaults, meanings and provenance (`cancelli config --init`
+writes the same list as comments):
+
+| Key | Default | Meaning | Source |
+|---|---|---|---|
+| `care.weights.sem` | `0.3` | L5 weight of s_sem (L2 semantic) | paper Eq. 6, App. A.5; care/policy.py:15-18 |
+| `care.weights.path` | `0.3` | L5 weight of s_path (L3 path) | paper Eq. 6, App. A.5; care/policy.py:15-18 |
+| `care.weights.pat` | `0.3` | L5 weight of s_pat (L4 rules) | paper Eq. 6, App. A.5; care/policy.py:15-18 |
+| `care.weights.struct` | `0.1` | L5 weight of δ_struct (L1 structure) | paper Eq. 6, App. A.5; care/policy.py:15-18 |
+| `care.modes.strict.tau_low` | `0.1` | strict: ALLOW below this score | paper Eq. 7; care/modes.py:32-55 |
+| `care.modes.strict.tau_high` | `0.2` | strict: DENY at or above this score | paper Eq. 7; care/modes.py:32-55 |
+| `care.modes.balanced.tau_low` | `0.15` | balanced: ALLOW below this score | paper Eq. 7; care/modes.py:32-55 |
+| `care.modes.balanced.tau_high` | `0.35` | balanced: DENY at or above this score | paper Eq. 7; care/modes.py:32-55 |
+| `care.modes.auto.tau_low` | `0.2` | auto: ALLOW below this score | paper Eq. 7; care/modes.py:32-55 |
+| `care.modes.auto.tau_high` | `0.5` | auto: DENY at or above this score | paper Eq. 7; care/modes.py:32-55 |
+| `care.resolution.theta_rule` | `0.8` | p_rule: a mitre/gtfobins rule with π·conf >= this skips the judge | paper App. A.6; care/resolution.py:44 (FIX-001) |
+| `care.resolution.theta_sem` | `0.7` | p_sem: an H_sem atom scoring >= this skips the judge | paper App. A.6; care/resolution.py:45 |
+| `care.resolution.h_sem` | `["NETWORK_FETCH", "EXECUTION_CHAIN", "PRIVILEGE_OR_PERMISSION", "PERSISTENCE", "DESTRUCTIVE"]` | L2 classes that can fire p_sem | paper App. A.6 H_sem (FIX-003) |
+| `care.provenance.mitre` | `1.0` | π for MITRE-tier rules (L4 score and p_rule) | paper App. A.4; care/pattern.py PROVENANCE_TIER_WEIGHT |
+| `care.provenance.gtfobins` | `0.85` | π for GTFOBins-tier rules | paper App. A.4; care/pattern.py PROVENANCE_TIER_WEIGHT |
+| `care.provenance.manual` | `0.6` | π for manual-tier rules | paper App. A.4; care/pattern.py PROVENANCE_TIER_WEIGHT |
+| `care.class_base.READ_ONLY` | `0.0` | L2 base score, READ_ONLY heads | care/common.py:28-39 CLASS_BASE_SCORE |
+| `care.class_base.WRITE_LOCAL` | `0.15` | L2 base score, WRITE_LOCAL heads | care/common.py:28-39 CLASS_BASE_SCORE |
+| `care.class_base.WRITE_SENSITIVE` | `0.7` | L2 base score, secret-path reads/writes | care/common.py:28-39 CLASS_BASE_SCORE |
+| `care.class_base.NETWORK_FETCH` | `0.4` | L2 base score, NETWORK_FETCH heads | care/common.py:28-39 CLASS_BASE_SCORE |
+| `care.class_base.EXECUTION_CHAIN` | `0.6` | L2 base score, shells/interpreters | care/common.py:28-39 CLASS_BASE_SCORE |
+| `care.class_base.PRIVILEGE_OR_PERMISSION` | `0.75` | L2 base score, privilege/permission heads | care/common.py:28-39 CLASS_BASE_SCORE |
+| `care.class_base.PERSISTENCE` | `0.8` | L2 base score, persistence heads | care/common.py:28-39 CLASS_BASE_SCORE |
+| `care.class_base.DESTRUCTIVE` | `1.0` | L2 base score, destructive heads (special cases like rm_rf keep their own scores) | care/common.py:28-39 CLASS_BASE_SCORE |
+| `care.class_base.RESOURCE_ABUSE` | `0.85` | L2 base score, resource-abuse heads | care/common.py:28-39 CLASS_BASE_SCORE |
+| `care.class_base.UNKNOWN` | `0.35` | L2 base score, unmapped heads | care/common.py:28-39 CLASS_BASE_SCORE |
+| `care.structure.pipe_to_exec` | `1.0` | δ_struct: pipeline ends in an interpreter | paper App. A.1; care/structure.py scoring ladder |
+| `care.structure.eval` | `0.9` | δ_struct: eval/source/. as a command head | paper App. A.1; care/structure.py scoring ladder |
+| `care.structure.nested_substitution` | `0.6` | δ_struct: command substitution nested >= 2 deep | paper App. A.1; care/structure.py scoring ladder |
+| `care.structure.command_substitution` | `0.3` | δ_struct: any $() or backticks | paper App. A.1; care/structure.py scoring ladder |
+| `care.structure.pipe` | `0.05` | δ_struct: any pipeline | paper App. A.1; care/structure.py scoring ladder |
+| `care.path.system_root` | `1.0` | s_path: destructive head on a system root (first hit decides) | care/path.py:151-245 PathValidator.validate |
+| `care.path.critical` | `1.0` | s_path: critical pattern (devices, shadow, keys, kernel; first hit decides) | care/path.py:151-245 PathValidator.validate |
+| `care.path.secret` | `0.85` | s_path: secret-bearing path | care/path.py:151-245 PathValidator.validate |
+| `care.path.sensitive_write` | `0.7` | s_path: sensitive system path, write context | care/path.py:151-245 PathValidator.validate |
+| `care.path.sensitive_read` | `0.1` | s_path: sensitive system path, read-only head | care/path.py:151-245 PathValidator.validate |
+| `care.path.sensitive_ambiguous` | `0.35` | s_path: sensitive system path, neither | care/path.py:151-245 PathValidator.validate |
+| `care.path.traversal_read` | `0.3` | s_path: ../ under a read-only head | care/path.py:151-245 PathValidator.validate |
+| `care.path.traversal` | `0.5` | s_path: ../ otherwise | care/path.py:151-245 PathValidator.validate |
+| `jev.rubric_file` | (embedded, `0fd1f245ae1c7ef3`) | alternative rubric YAML (logged and fingerprinted by its rubric_hash) | D19; embedded data/jev/v1_policy_distilled.yaml |
+| `jev.thresholds.transport` | `0.95` | transport: a5_outbound_data > this (T1, T4) | FINDINGS §5; jev-integration-spec §4.2 |
+| `jev.thresholds.sensitive` | `0.5` | sensitive: max(a1_reads_credentials, a7_personal_data) > this (T1, T4) | FINDINGS §5; jev-integration-spec §4.2 |
+| `jev.thresholds.unknown` | `0.5` | unknown: a6 argmax one-hot for unknown_remote > this (T1) | rubric a6 use: predicate; jev-integration-spec §4.2 declared row |
+| `jev.thresholds.unknown_f5_gate` | `0.8` | a6 is read only when f5_exceeds_approval > this (overrides the rubric's a6 when.over) | rubric a6 when.over; FINDINGS §5 |
+| `jev.thresholds.f5_deny` | `0.9` | T2: f5_exceeds_approval > this | FINDINGS §5; jev-integration-spec §4.2 |
+| `jev.thresholds.f5_ask` | `0.5` | T5: f5_exceeds_approval > this | FINDINGS §5; jev-integration-spec §4.2 |
+| `jev.thresholds.obfuscated` | `0.2` | T3: d1_obfuscated > this | FINDINGS §5; jev-integration-spec §4.2 |
+| `jev.thresholds.irreversible` | `0.25` | T3: b4_reversibility (score/3) > this | FINDINGS §5; jev-integration-spec §4.2 |
+| `jev.tiers.order` | `["T1", "T2", "T3", "T4", "T5"]` | first-match order of T1..T5; a tier left out never fires; T6 = none fired | FINDINGS §5; jev-integration-spec §4.2 |
+| `jev.verdicts.T1` | `"deny"` | verdict for T1 (allow\|ask\|deny) | D14 |
+| `jev.verdicts.T2` | `"deny"` | verdict for T2 | D14 |
+| `jev.verdicts.T3` | `"ask"` | verdict for T3 | D14 |
+| `jev.verdicts.T4` | `"ask"` | verdict for T4 | D14 |
+| `jev.verdicts.T5` | `"ask"` | verdict for T5 | D14 |
+| `jev.verdicts.T6` | `"allow"` | verdict when no tier fires (allow still emits only with decide_all, D13) | D14 |
+| `jev.context.field_chars` | `4000` | clip for args, the user request and each prior call (characters) | POC jev_gate/prepare.py; jev-integration-spec §3.3 |
+| `jev.context.history_chars` | `12000` | history budget for prior calls, newest kept first (characters) | POC jev_gate/prepare.py; jev-integration-spec §3.3 |
+| `jev.context.max_level` | `"L2"` | highest context level: L0 action, L1 +user request, L2 +prior calls | D16; POC jev_gate/context.py |
+| `care.rules."SE-P-NNN".enabled` | `true` | `false` removes the rule from L4 matching and from p_rule | D18 |
+| `care.rules."SE-P-NNN".confidence` | the bank's value | replaces the rule's confidence in L4 (π·conf) and in p_rule | data/rule_provenance.json (care/rules/rule_provenance.json) |
+
+The default of `care.resolution.h_sem` is the paper's set (FIX-003).
+`care.rules` accepts either `[care.rules."SE-P-103"]` tables or inline tables
+under `[care.rules]`. `enabled = false` removes the rule from L4 matching and
+so from `p_rule`. `confidence` feeds both L4 (π·conf) and `p_rule`. The
+reference-comparison predicate that tags FIX-001 sees the same confidence.
+The L1 ladder stays first-match, and the L3 system-root/critical hits still
+decide the path score on first match, whatever values you give them.
+
+### Constant inventory
+
+Every hard-coded constant in `src/` (policy, modes, resolution, semantic,
+structure, path, pattern, rules, jev/decide, jev/state, jev/transcript,
+jev/rubric), and whether it is exposed:
+
+| Group (file) | Constants | Exposed as |
+|---|---|---|
+| L5 weights (policy.rs) | 4 | `care.weights.*` |
+| Mode thresholds (policy.rs `Mode::thresholds`) | 6 | `care.modes.<mode>.tau_low/tau_high` |
+| Resolution (resolution.rs) | θ_rule, θ_sem, H_sem (paper) | `care.resolution.*` |
+| Provenance π (rules.rs `Tier::weight`) | 3 | `care.provenance.*` |
+| L2 class base scores (semantic.rs `RiskClass::base`) | 10 | `care.class_base.*` |
+| L1 ladder (structure.rs) | 5 | `care.structure.*` |
+| L3 tier scores (path.rs) | 8 | `care.path.*` |
+| Rule bank (rules.rs, `data/rule_provenance.json`) | 139 confidences, 139 implicit enables | `care.rules."SE-P-NNN".*` |
+| Jev tier thresholds (jev/decide.rs `tier`) | 7, plus the a6 gate from the rubric | `jev.thresholds.*` |
+| Jev tier order and verdicts (jev/decide.rs `TIERS`) | order + 6 verdicts | `jev.tiers.order`, `jev.verdicts.*` |
+| Jev context (jev/state.rs, jev/transcript.rs) | 4,000 / 12,000 chars, max level | `jev.context.*` |
+| Jev rubric (jev/rubric.rs) | embedded YAML | `jev.rubric_file` |
+
+Deliberately **not** exposed, and why:
+
+| Constant(s) | Where | Why not |
+|---|---|---|
+| 21 special-case L2 scores (`rm_rf` 0.9, `rm_rf_critical` 1.0, `rm_recursive` 0.7, `rm_files` 0.3, `git_push_force` 0.85, `git_reset_hard` 0.80, `git_clean_force` 0.70, `chmod_777_sensitive` 0.95, `chmod_777` 0.80, `chmod_suid`/`chmod_setuid_sym` 0.85, `chmod_normal` 0.35, `dd_block_device` 1.0, `dd_to_null` 0.1, `dd_generic` 0.6, `docker_privileged` 0.90, `docker_read` 0.0, `kill_init` 0.95, `killall_critical`/`pkill_root` 0.90, empty atom 0.0) | semantic.rs | Each is bound to a specific lexicon/regex match; D18 keeps lexicons embedded, and D18 names only the class base scores |
+| Nested-substitution depth 2, recursion cap 8, interpreter list | structure.rs | Structural definitions of a ladder rung, not scores |
+| L3 early return on the first system-root/critical hit | path.rs | Control flow of the reference, not a value |
+| Rounding (`effective` 3 dp, scores/aggregate 4 dp) | pattern.rs, engine.rs | Output format for parity with Python |
+| `H_SEM_REPO` | resolution.rs | Reference set, used only to tag FIX-003 |
+| CARE judge prompt text, text-judge timeout 2,000 ms | resolution.rs, engine.rs | Text-judge path only (not Jev); the hook's timeouts are `[judge]` |
+| Predicate default cut 0.5, score legend default 4, graded choice labels | jev/decide.rs, jev/rubric.rs | POC signal extraction; a rubric sets `threshold:` per axis itself |
+| Decode minimums (base64 ≥ 12 chars/8 bytes, `\x` ≥ 4, hex ≥ 32), printable ratio 0.85, +8 per-turn budget overhead, section headers | jev/state.rs | Part of the POC render template (D16 "exactly as in the POC"); a change would move states off the calibration distribution |
+| System-injected prefixes/markers | jev/transcript.rs | Lexicon (a filter), extended in code |
+| Criteria-level bounds 2..10, gate validity | jev/rubric.rs | Rubric lint, the same for every rubric |
+| Model pin, retry backoff 500 ms, minimum attempt 200 ms, backstop +1,500 ms | jev/client.rs, jev/mod.rs | Transport, not adjudication; timeout and budget are already `[judge]` keys |
+
 ## Log schema
 
 Records are appended to `<log dir>/events-YYYY-MM-DD.jsonl` (local date), file
@@ -164,7 +391,9 @@ interleave. The log dir is `$CANCELLI_LOG_DIR`, else `[log].dir`, else
 
 Common fields: `kind` (`event` | `error` | `warning`), `ts`, `version`,
 `rules_version`, `session_id`, `tool_use_id`, `cwd`, `permission_mode`,
-`tool_name`, `mode`, `dry_run`, `latency_us`.
+`tool_name`, `mode`, `dry_run`, `latency_us`, and on every record
+`config_fingerprint`, `overrides[]` and `rubric_hash` (see
+[Tuning](#tuning)).
 
 For `Bash`, an `event` adds: `command`, `views[]`, `layers{L1,L2,L3,L4}` (each
 score + evidence), `fired_rules[{id,tier,conf,pi,family,effective,…}]`,
@@ -319,7 +548,9 @@ unresolved WARN is a Jev failure (`ask`), and no request is made.
 
 Signals are the POC's `signals()` with the rubric's declarations applied.
 Tiers are evaluated first-match with strict `>` comparisons and the
-thresholds from the spec (§4.2):
+thresholds from the spec (§4.2). These are the defaults; thresholds, order
+and verdicts are tunable (`[jev]`, see [Tuning](#tuning)), and `tier_rule` in
+the judge record shows the thresholds actually in force:
 
 | Tier | Predicate | Verdict | Measured deny purity* |
 |---|---|---|---|

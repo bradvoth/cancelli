@@ -16,10 +16,12 @@ use crate::pattern::FiredRule;
 use crate::pyre::py_float_repr;
 use crate::rules::{RuleBank, Tier};
 use crate::semantic::RiskClass;
+use crate::tunables::CareTunables;
 
-/// θ_rule (resolution.py:44; paper App. A.6).
+/// θ_rule (resolution.py:44; paper App. A.6); default of
+/// `care.resolution.theta_rule`.
 pub const THETA_RULE: f64 = 0.80;
-/// θ_sem (resolution.py:45).
+/// θ_sem (resolution.py:45); default of `care.resolution.theta_sem`.
 pub const THETA_SEM: f64 = 0.70;
 
 /// FIX-003: paper H_sem = {destructive, priv-escalate, exec-chaining,
@@ -58,21 +60,23 @@ pub struct SemAtom {
     pub score: f64,
 }
 
-fn p_rule_paper(fired: &[FiredRule]) -> Option<String> {
+fn p_rule_paper(fired: &[FiredRule], theta: f64) -> Option<String> {
     fired
         .iter()
-        .find(|m| matches!(m.tier, Tier::Mitre | Tier::Gtfobins) && m.pi * m.conf >= THETA_RULE)
+        .find(|m| matches!(m.tier, Tier::Mitre | Tier::Gtfobins) && m.pi * m.conf >= theta)
         .map(|m| format!("p_rule:{}", m.id))
 }
 
-fn p_rule_repo(fired: &[FiredRule], bank: &RuleBank) -> Option<String> {
+/// The reference predicate, fed the same (possibly overridden) confidence
+/// and θ_rule so FIX-001 tags only differences in logic.
+fn p_rule_repo(fired: &[FiredRule], bank: &RuleBank, theta: f64) -> Option<String> {
     for m in fired {
-        if m.tier == Tier::Mitre && m.conf >= THETA_RULE {
+        if m.tier == Tier::Mitre && m.conf >= theta {
             return Some(format!("p_rule:{}", m.id));
         }
         if let Some(r) = bank.rules.iter().find(|r| r.id == m.id)
             && !r.mitre.is_empty()
-            && r.confidence >= THETA_RULE
+            && m.conf >= theta
         {
             return Some(format!("p_rule:{}", m.id));
         }
@@ -92,33 +96,35 @@ pub fn p_spath_paper(paths: &[PathResult]) -> bool {
     })
 }
 
-fn p_sem(atoms: &[SemAtom], set: &[RiskClass]) -> Option<String> {
+fn p_sem(atoms: &[SemAtom], set: &[RiskClass], theta: f64) -> Option<String> {
     atoms
         .iter()
-        .find(|a| set.contains(&a.class) && a.score >= THETA_SEM)
+        .find(|a| set.contains(&a.class) && a.score >= theta)
         .map(|a| format!("p_sem:{}", a.class.as_str()))
 }
 
 /// Evaluate `skip(c) = p_rule ∨ p_spath ∨ p_sem` (paper definitions) and
 /// tag FIX-001..003 wherever a predicate's outcome differs from the repo's.
+/// θ_rule, θ_sem and H_sem come from the tunables (`care.resolution`).
 pub fn skip_predicate(
     fired: &[FiredRule],
     path_score: f64,
     paths: &[PathResult],
     atoms: &[SemAtom],
     bank: &RuleBank,
+    t: &CareTunables,
     tags: &mut Tags,
 ) -> Option<String> {
-    let rule = p_rule_paper(fired);
-    if rule != p_rule_repo(fired, bank) {
+    let rule = p_rule_paper(fired, t.theta_rule);
+    if rule != p_rule_repo(fired, bank, t.theta_rule) {
         tags.fix("FIX-001");
     }
     let spath = p_spath_paper(paths);
     if spath != (path_score > 0.0) {
         tags.fix("FIX-002");
     }
-    let sem = p_sem(atoms, H_SEM_PAPER);
-    if sem != p_sem(atoms, H_SEM_REPO) {
+    let sem = p_sem(atoms, &t.h_sem, t.theta_sem);
+    if sem != p_sem(atoms, H_SEM_REPO, t.theta_sem) {
         tags.fix("FIX-003");
     }
     rule.or_else(|| spath.then(|| "p_spath".to_string()))
@@ -131,10 +137,11 @@ pub fn skip_predicate_reference(
     path_score: f64,
     atoms: &[SemAtom],
     bank: &RuleBank,
+    t: &CareTunables,
 ) -> Option<String> {
-    p_rule_repo(fired, bank)
+    p_rule_repo(fired, bank, t.theta_rule)
         .or_else(|| (path_score > 0.0).then(|| "p_spath".to_string()))
-        .or_else(|| p_sem(atoms, H_SEM_REPO))
+        .or_else(|| p_sem(atoms, H_SEM_REPO, t.theta_sem))
 }
 
 /// A rendered judge prompt.

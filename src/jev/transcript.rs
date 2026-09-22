@@ -23,8 +23,9 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use serde_json::Value;
 
-use super::state::{Level, MAX_FIELD_CHARS, call_text, py_len};
+use super::state::{Level, MAX_FIELD_CHARS, call_text_with, py_len};
 use crate::pyre::py_strip;
+use crate::tunables::ContextLimits;
 
 /// Stripped user text starting with any of these is system-injected, not
 /// typed by the human. Extend here.
@@ -145,12 +146,17 @@ pub fn tool_uses(rec: &Value) -> Vec<ToolUse> {
 /// ShellRisk vocabulary, and the same mapping as the proposed action), any
 /// other tool as `Name(<Python json.dumps(input, sort_keys=True)>)`.
 pub fn prior_call_text(t: &ToolUse) -> String {
+    prior_call_text_with(t, MAX_FIELD_CHARS)
+}
+
+/// [`prior_call_text`] with a tunable clip (`jev.context.field_chars`).
+pub fn prior_call_text_with(t: &ToolUse, field_chars: usize) -> String {
     if t.name == "Bash"
         && let Some(cmd) = t.input.get("command").and_then(Value::as_str)
     {
-        return call_text("bash", &Value::String(cmd.to_string()));
+        return call_text_with("bash", &Value::String(cmd.to_string()), field_chars);
     }
-    call_text(&t.name, &t.input)
+    call_text_with(&t.name, &t.input, field_chars)
 }
 
 /// What a transcript yields.
@@ -200,8 +206,13 @@ pub fn parse(reader: impl BufRead, current_id: Option<&str>) -> std::io::Result<
 /// (separators counted). Returns the text and whether older prompts were
 /// dropped.
 pub fn join_user_request(prompts: &[String]) -> (String, usize) {
+    join_user_request_with(prompts, MAX_FIELD_CHARS)
+}
+
+/// [`join_user_request`] with a tunable budget (`jev.context.field_chars`).
+pub fn join_user_request_with(prompts: &[String], budget: usize) -> (String, usize) {
     let joined = prompts.join("\n\n");
-    if py_len(&joined) <= MAX_FIELD_CHARS {
+    if py_len(&joined) <= budget {
         return (joined, prompts.len());
     }
     let Some((last, older)) = prompts.split_last() else {
@@ -211,7 +222,7 @@ pub fn join_user_request(prompts: &[String]) -> (String, usize) {
     let mut used = py_len(last);
     for p in older.iter().rev() {
         let cost = py_len(p) + 2;
-        if used + cost > MAX_FIELD_CHARS {
+        if used + cost > budget {
             break;
         }
         used += cost;
@@ -261,8 +272,15 @@ fn read(path: &Path, id: Option<&str>) -> std::io::Result<Parsed> {
     parse(std::io::BufReader::new(f), id)
 }
 
-/// Build the context for one call.
+/// Build the context for one call with the built-in limits.
 pub fn build(src: &ContextSource) -> Context {
+    build_with(src, &ContextLimits::default())
+}
+
+/// Build the context for one call under `jev.context`: clip, and the
+/// highest level allowed (`max_level`; the achieved level is capped and the
+/// reason says so).
+pub fn build_with(src: &ContextSource, limits: &ContextLimits) -> Context {
     let mut c = Context {
         level: Level::L0,
         level_reason: String::new(),
@@ -298,7 +316,11 @@ pub fn build(src: &ContextSource) -> Context {
             "transcript".into()
         };
         c.actions_total = p.prior.len();
-        c.prior_actions = p.prior.iter().map(prior_call_text).collect();
+        c.prior_actions = p
+            .prior
+            .iter()
+            .map(|t| prior_call_text_with(t, limits.field_chars))
+            .collect();
         c.level = if c.prior_actions.is_empty() {
             Level::L1
         } else {
@@ -312,8 +334,15 @@ pub fn build(src: &ContextSource) -> Context {
             c.level = Level::L1;
         }
     }
+    if c.level > limits.max_level {
+        c.level = limits.max_level;
+        c.level_reason.push_str(&format!(
+            "; capped at {} by jev.context.max_level",
+            limits.max_level.value()
+        ));
+    }
     c.prompts_total = prompts.len();
-    let (req, kept) = join_user_request(&prompts);
+    let (req, kept) = join_user_request_with(&prompts, limits.field_chars);
     c.user_request = req;
     c.prompts_kept = kept;
     if c.level == Level::L1 && c.user_request.is_empty() {
@@ -493,5 +522,49 @@ mod tests {
         let huge = vec!["x".to_string(), "y".repeat(6000)];
         let (req, kept) = join_user_request(&huge);
         assert_eq!((req.len(), kept), (6000, 1));
+    }
+
+    #[test]
+    fn max_level_caps_and_field_chars_clip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("t.jsonl");
+        let lines = [
+            json!({"type": "user", "message": {"role": "user", "content": "do the thing"}}),
+            json!({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "a", "name": "Bash", "input": {"command": "ls -la"}}]}}),
+        ];
+        let text: Vec<String> = lines.iter().map(Value::to_string).collect();
+        std::fs::write(&p, text.join("\n")).unwrap();
+        let src = ContextSource {
+            transcript_path: Some(p),
+            tool_use_id: None,
+            request_override: None,
+        };
+        assert_eq!(build(&src).level, Level::L2);
+        let mut lim = ContextLimits {
+            max_level: Level::L1,
+            ..ContextLimits::default()
+        };
+        let c = build_with(&src, &lim);
+        assert_eq!(c.level, Level::L1);
+        assert!(
+            c.level_reason
+                .ends_with("capped at l1_request by jev.context.max_level")
+        );
+        lim.max_level = Level::L0;
+        assert_eq!(build_with(&src, &lim).level, Level::L0);
+        lim = ContextLimits {
+            field_chars: 4,
+            ..ContextLimits::default()
+        };
+        let c = build_with(&src, &lim);
+        assert_eq!(
+            c.prior_actions,
+            vec!["bash(ls -\n[... truncated, 2 more characters])"]
+        );
+        assert_eq!(
+            c.user_request, "do the thing",
+            "a single prompt is clipped later"
+        );
     }
 }

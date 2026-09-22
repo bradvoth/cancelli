@@ -155,6 +155,7 @@ fn main() -> ExitCode {
             let opts = Options {
                 mode: loaded.config.mode,
                 home: env.home.unwrap_or_default(),
+                care: loaded.config.tunables.care,
                 ..Options::default()
             };
             match engine::analyze(&command, &opts) {

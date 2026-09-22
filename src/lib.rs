@@ -20,6 +20,7 @@ pub mod resolution;
 pub mod rules;
 pub mod semantic;
 pub mod structure;
+pub mod tunables;
 
 /// Crate version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

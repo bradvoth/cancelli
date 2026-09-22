@@ -17,6 +17,7 @@ use crate::resolution::{
 use crate::rules;
 use crate::semantic::{self, RiskClass};
 use crate::structure::{self, Structure};
+use crate::tunables::CareTunables;
 
 /// Per-call options.
 #[derive(Clone)]
@@ -29,6 +30,8 @@ pub struct Options {
     pub adjudicator: Arc<dyn Adjudicator>,
     /// Judge timeout (FIX-008).
     pub judge_timeout: Duration,
+    /// CARE tunables (D18); the default reproduces the built-in constants.
+    pub care: CareTunables,
 }
 
 impl Default for Options {
@@ -38,6 +41,7 @@ impl Default for Options {
             home: std::env::var("HOME").unwrap_or_default(),
             adjudicator: Arc::new(StubAdjudicator),
             judge_timeout: Duration::from_millis(2000),
+            care: CareTunables::default(),
         }
     }
 }
@@ -197,7 +201,7 @@ pub fn analyze(cmd: &str, opts: &Options) -> Result<Analysis, EngineError> {
     let l1_views: Vec<Structure> = views
         .iter()
         .enumerate()
-        .map(|(i, v)| structure::analyze(i, &v.text, &mut tags))
+        .map(|(i, v)| structure::analyze_with(i, &v.text, &mut tags, &opts.care.structure))
         .collect();
     let struct_score = l1_views
         .iter()
@@ -216,7 +220,7 @@ pub fn analyze(cmd: &str, opts: &Options) -> Result<Analysis, EngineError> {
             if atoms.iter().any(|x| x.atom == a) {
                 continue;
             }
-            let c = semantic::classify(&a, &mut tags);
+            let c = semantic::classify_with(&a, &mut tags, &opts.care.class_base);
             atoms.push(AtomClass {
                 atom: a,
                 view: s.view,
@@ -239,7 +243,7 @@ pub fn analyze(cmd: &str, opts: &Options) -> Result<Analysis, EngineError> {
     let l3_views: Vec<PathResult> = views
         .iter()
         .enumerate()
-        .map(|(i, v)| path::validate(i, &v.text, &opts.home, &mut tags))
+        .map(|(i, v)| path::validate_with(i, &v.text, &opts.home, &mut tags, &opts.care.path))
         .collect();
     let mut path_score = 0.0;
     let mut path_reason = "paths_ok".to_string();
@@ -251,7 +255,7 @@ pub fn analyze(cmd: &str, opts: &Options) -> Result<Analysis, EngineError> {
     }
 
     // L4
-    let pat = pattern::detect(bank, &views);
+    let pat = pattern::detect_with(bank, &views, &opts.care);
     let pat_score = pat.score;
 
     // L5
@@ -268,8 +272,14 @@ pub fn analyze(cmd: &str, opts: &Options) -> Result<Analysis, EngineError> {
     if pat_score > 0.0 {
         triggered.push("L4_Pattern");
     }
-    let final_score = policy::compose(sem_score, path_score, pat_score, struct_score);
-    let provisional = Provisional::of(final_score);
+    let final_score = policy::compose_with(
+        &opts.care.weights,
+        sem_score,
+        path_score,
+        pat_score,
+        struct_score,
+    );
+    let provisional = Provisional::of_with(final_score, &opts.care.modes);
     let aggregate = py_round(final_score, 4);
 
     // Stage 3
@@ -281,9 +291,10 @@ pub fn analyze(cmd: &str, opts: &Options) -> Result<Analysis, EngineError> {
         })
         .collect();
     let skip = resolution::skip_predicate(
-        &pat.fired, path_score, &l3_views, &sem_atoms, bank, &mut tags,
+        &pat.fired, path_score, &l3_views, &sem_atoms, bank, &opts.care, &mut tags,
     );
-    let skip_ref = resolution::skip_predicate_reference(&pat.fired, path_score, &sem_atoms, bank);
+    let skip_ref =
+        resolution::skip_predicate_reference(&pat.fired, path_score, &sem_atoms, bank, &opts.care);
     let rule_ids: Vec<String> = pat.fired.iter().map(|r| r.id.clone()).collect();
     let verdict = provisional.get(opts.mode);
     let would_adjudicate = verdict == Verdict::Warn && skip.is_none();

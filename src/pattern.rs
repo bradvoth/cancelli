@@ -6,6 +6,7 @@ use serde::Serialize;
 use crate::canon::View;
 use crate::pyre::py_round;
 use crate::rules::{RuleBank, Tier};
+use crate::tunables::CareTunables;
 
 /// One fired rule.
 #[derive(Debug, Clone, Serialize)]
@@ -40,18 +41,30 @@ pub struct PatternResult {
 /// Match every rule against every view (FIX-006: views replace the
 /// reference's single marker-augmented string).
 pub fn detect(bank: &RuleBank, views: &[View]) -> PatternResult {
+    detect_with(bank, views, &CareTunables::default())
+}
+
+/// [`detect`] with tunables: provenance weights π (`care.provenance`) and
+/// per-rule overrides (`care.rules."SE-P-NNN"`). A disabled rule is never
+/// matched; an overridden confidence is the one reported in `conf` and so
+/// also the one `p_rule` uses.
+pub fn detect_with(bank: &RuleBank, views: &[View], t: &CareTunables) -> PatternResult {
     let mut best = 0.0_f64;
     let mut fired = Vec::new();
     for r in &bank.rules {
+        if !t.rule_enabled(&r.id) {
+            continue;
+        }
         let Some(view) = views.iter().position(|v| r.pattern.is_match(&v.text)) else {
             continue;
         };
-        let pi = r.tier.weight();
-        let eff = pi * r.confidence;
+        let pi = t.provenance.get(r.tier);
+        let conf = t.rule_confidence(&r.id, r.confidence);
+        let eff = pi * conf;
         fired.push(FiredRule {
             id: r.id.clone(),
             tier: r.tier,
-            conf: r.confidence,
+            conf,
             pi,
             family: r.family.clone(),
             effective: py_round(eff, 3),
