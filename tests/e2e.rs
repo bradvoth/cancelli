@@ -27,6 +27,9 @@ fn run_in(args: &[&str], stdin: &str, home: &std::path::Path, logdir: &std::path
         .env("CANCELLI_LOG_DIR", logdir)
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("CANCELLI_MODE")
+        // Never reach the network: with no key, Jev fails before connecting.
+        .env_remove("TYPESAFE_API_KEY")
+        .env_remove("TYPESAFE_BASE_URL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -67,7 +70,7 @@ fn run_enforce(args: &[&str], stdin: &str) -> Run {
 fn payload(tool: &str, input: Value) -> String {
     serde_json::json!({
         "session_id": "sess-1",
-        "transcript_path": "/tmp/t.jsonl",
+        "transcript_path": "/nonexistent/cancelli-e2e/t.jsonl",
         "cwd": "/work",
         "permission_mode": "default",
         "hook_event_name": "PreToolUse",
@@ -144,22 +147,67 @@ fn dry_run_obfuscated_base64_decodes_and_denies() {
     );
 }
 
+// Expectation changed by D11/D15 (stub -> Jev): a WARN with no skip now goes
+// to Jev; with no API key that is a Jev failure, so `final` is "ask" (was
+// "unadjudicated") with an error record. The CARE judge prompt is still
+// logged. `backend = "stub"` keeps the old behaviour (next test).
 #[test]
-fn warn_without_skip_is_unadjudicated_with_prompt() {
+fn warn_without_skip_goes_to_jev_and_asks_without_key() {
     let cmd = "rsync -avz ./data user@host:/backup/";
     let r = run(
         &["hook", "--dry-run"],
         &payload("Bash", serde_json::json!({"command": cmd})),
     );
+    assert_eq!((r.code, r.stdout.as_str()), (0, ""));
     let rec = r.records.iter().find(|r| r["kind"] == "event").unwrap();
-    assert_eq!(rec["final"], "unadjudicated");
+    assert_eq!(rec["final"], "ask");
     assert_eq!(rec["would_adjudicate"], true);
     assert_eq!(rec["would_emit"], "ask");
     let user = rec["judge_prompt"]["user"].as_str().unwrap();
     assert!(user.contains("rsync -avz ./data user@host:/backup/"));
     assert!(user.contains("composite risk score: 0.345"));
     assert!(user.contains("fired rule IDs:       SE-P-103"));
-    assert!(rec["judge"]["decision"] == "unadjudicated");
+    assert_eq!(rec["judge"]["backend"], "jev");
+    assert_eq!(rec["judge"]["decision"], "ask");
+    assert_eq!(rec["judge"]["verdict"], "ask");
+    // the payload's transcript does not exist -> L0
+    assert_eq!(rec["judge"]["level"], "l0_action");
+    assert!(
+        rec["judge"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("no Jev API key")
+    );
+    let err = r
+        .records
+        .iter()
+        .find(|r| r["kind"] == "error" && r["stage"] == "judge")
+        .unwrap();
+    assert_eq!(err["tool_use_id"], "tu-1");
+}
+
+#[test]
+fn stub_backend_keeps_warn_unadjudicated() {
+    let home = TempDir::new().unwrap();
+    let logdir = TempDir::new().unwrap();
+    let cfg = home.path().join(".config/cancelli");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(cfg.join("config.toml"), "[judge]\nbackend = \"stub\"\n").unwrap();
+    let r = run_in(
+        &["hook", "--dry-run"],
+        &payload(
+            "Bash",
+            serde_json::json!({"command": "rsync -avz ./data user@host:/backup/"}),
+        ),
+        home.path(),
+        logdir.path(),
+    );
+    let rec = r.records.iter().find(|r| r["kind"] == "event").unwrap();
+    assert_eq!(rec["final"], "unadjudicated");
+    assert_eq!(rec["would_emit"], "ask");
+    assert_eq!(rec["judge"]["backend"], "stub");
+    assert_eq!(rec["judge"]["decision"], "unadjudicated");
+    assert!(!r.records.iter().any(|r| r["kind"] == "error"));
 }
 
 #[test]
@@ -335,4 +383,34 @@ fn analyze_emits_json() {
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(v["aggregate"], 0.765);
     assert_eq!(v["final"], "deny");
+}
+
+#[test]
+fn non_utf8_environment_does_not_break_the_hook() {
+    use std::os::unix::ffi::OsStrExt;
+    let home = TempDir::new().unwrap();
+    let logdir = TempDir::new().unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cancelli"))
+        .args(["hook", "--dry-run"])
+        .env("HOME", home.path())
+        .env("CANCELLI_LOG_DIR", logdir.path())
+        .env_remove("TYPESAFE_API_KEY")
+        .env(
+            "CANCELLI_TEST_BAD",
+            std::ffi::OsStr::from_bytes(b"\xff\xfe"),
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload("Bash", serde_json::json!({"command": "git status"})).as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    assert!(out.stdout.is_empty() && out.stderr.is_empty());
 }

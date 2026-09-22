@@ -1,6 +1,7 @@
 //! Stage 3 — Resolution: skip predicates (paper Eqs. 8–11), the judge prompt
 //! (paper Prompt 1 = `care/resolution.py` template), the [`Adjudicator`]
-//! trait with a stub (D7), FIX-004 output parsing and the FIX-008 timeout.
+//! trait with a stub (D7) and the Jev backend (D11, `crate::jev`), FIX-004
+//! output parsing for text judges and the FIX-008 timeout.
 
 use std::sync::Arc;
 use std::sync::mpsc;
@@ -9,6 +10,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use crate::fixes::Tags;
+use crate::jev::JudgeRecord;
 use crate::path::{Access, PathResult, PathTier};
 use crate::pattern::FiredRule;
 use crate::pyre::py_float_repr;
@@ -191,18 +193,29 @@ pub fn render_prompt(
     }
 }
 
-/// What an adjudicator returned.
+/// What a judge sees for one unresolved WARN.
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JudgeInput {
+    /// The raw Bash command.
+    pub command: String,
+    /// CARE Prompt 1 (text judges).
+    pub prompt: JudgePrompt,
+}
+
+/// What an adjudicator returned.
+#[derive(Debug, Clone)]
 pub enum Adjudication {
     /// No judge is configured (stub).
     Unadjudicated,
-    /// Raw model text.
+    /// Raw model text (text judges; FIX-004 parsing).
     Response(String),
     /// Transport or model error.
     Error(String),
+    /// A Jev judgement (its own verdict, including failures -> ask).
+    Jev(Box<JudgeRecord>),
 }
 
-/// A WARN-band judge (paper "J"; step 2 plugs a local model in here).
+/// A WARN-band judge (paper "J").
 pub trait Adjudicator: Send + Sync {
     /// Backend name for logs.
     fn name(&self) -> &str;
@@ -210,8 +223,13 @@ pub trait Adjudicator: Send + Sync {
     fn blocking(&self) -> bool {
         true
     }
-    /// Adjudicate one prompt.
-    fn adjudicate(&self, prompt: &JudgePrompt) -> Adjudication;
+    /// Decision when the judge errors or times out: DENY for text judges
+    /// (paper: fail closed), ASK for Jev (D15).
+    fn failure_decision(&self) -> Final {
+        Final::Deny
+    }
+    /// Adjudicate one WARN.
+    fn adjudicate(&self, input: &JudgeInput) -> Adjudication;
 }
 
 /// D7 stub: never calls a model.
@@ -225,7 +243,7 @@ impl Adjudicator for StubAdjudicator {
     fn blocking(&self) -> bool {
         false
     }
-    fn adjudicate(&self, _prompt: &JudgePrompt) -> Adjudication {
+    fn adjudicate(&self, _input: &JudgeInput) -> Adjudication {
         Adjudication::Unadjudicated
     }
 }
@@ -271,6 +289,8 @@ pub enum Final {
     Allow,
     /// Denied.
     Deny,
+    /// Ask the user (Jev T3–T5, or Jev failed; D14/D15).
+    Ask,
     /// WARN without skip, and the judge is a stub.
     Unadjudicated,
 }
@@ -281,16 +301,19 @@ impl Final {
         match self {
             Final::Allow => "allow",
             Final::Deny => "deny",
+            Final::Ask => "ask",
             Final::Unadjudicated => "unadjudicated",
         }
     }
 }
 
-/// Outcome of a judge call.
+/// Outcome of a judge call. For Jev, the [`JudgeRecord`] fields are
+/// flattened in (and carry `backend`/`error` themselves).
 #[derive(Debug, Clone, Serialize)]
 pub struct JudgeOutcome {
-    /// Backend name.
-    pub backend: String,
+    /// Backend name (text judges and the stub).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backend: Option<String>,
     /// Final decision it implies.
     pub decision: Final,
     /// Raw response.
@@ -299,24 +322,38 @@ pub struct JudgeOutcome {
     /// Parsed verdict.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verdict: Option<JudgeVerdict>,
-    /// Error / timeout description.
+    /// Error / timeout description (text judges, and the FIX-008 backstop).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// The Jev record.
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    pub jev: Option<Box<JudgeRecord>>,
+}
+
+impl JudgeOutcome {
+    /// The error, wherever it is recorded.
+    pub fn error_message(&self) -> Option<&str> {
+        self.error
+            .as_deref()
+            .or_else(|| self.jev.as_ref().and_then(|j| j.error.as_deref()))
+    }
 }
 
 /// Call the adjudicator; blocking backends run on a worker thread bounded by
 /// `timeout` (FIX-008: the reference sets no timeout). Errors and timeouts
-/// fail closed (DENY), as in the paper and the reference's exception path.
+/// take the backend's [`Adjudicator::failure_decision`]: DENY (fail closed,
+/// as in the paper) for text judges, ASK for Jev (D15).
 pub fn run_judge(
     adj: Arc<dyn Adjudicator>,
-    prompt: &JudgePrompt,
+    input: &JudgeInput,
     timeout: Duration,
     tags: &mut Tags,
 ) -> JudgeOutcome {
-    let backend = adj.name().to_string();
+    let backend = Some(adj.name().to_string());
+    let on_failure = adj.failure_decision();
     let result = if adj.blocking() {
         let (tx, rx) = mpsc::channel();
-        let p = prompt.clone();
+        let p = input.clone();
         let a = Arc::clone(&adj);
         let spawned = std::thread::Builder::new()
             .name("cancelli-judge".into())
@@ -337,7 +374,7 @@ pub fn run_judge(
             },
         }
     } else {
-        adj.adjudicate(prompt)
+        adj.adjudicate(input)
     };
     match result {
         Adjudication::Unadjudicated => JudgeOutcome {
@@ -346,13 +383,23 @@ pub fn run_judge(
             raw: None,
             verdict: None,
             error: None,
+            jev: None,
         },
         Adjudication::Error(e) => JudgeOutcome {
             backend,
-            decision: Final::Deny,
+            decision: on_failure,
             raw: None,
             verdict: None,
             error: Some(e),
+            jev: None,
+        },
+        Adjudication::Jev(rec) => JudgeOutcome {
+            backend: None,
+            decision: rec.decision(),
+            raw: None,
+            verdict: None,
+            error: None,
+            jev: Some(rec),
         },
         Adjudication::Response(text) => {
             let verdict = parse_judge_output(&text);
@@ -370,6 +417,7 @@ pub fn run_judge(
                 raw: Some(text),
                 verdict: Some(verdict),
                 error: None,
+                jev: None,
             }
         }
     }
@@ -378,6 +426,13 @@ pub fn run_judge(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn input(cmd: &str) -> JudgeInput {
+        JudgeInput {
+            command: cmd.into(),
+            prompt: render_prompt(cmd, 0.2, &[], &[]),
+        }
+    }
 
     #[test]
     fn prompt_matches_reference_format() {
@@ -419,13 +474,13 @@ mod tests {
             fn name(&self) -> &str {
                 "garbage"
             }
-            fn adjudicate(&self, _: &JudgePrompt) -> Adjudication {
+            fn adjudicate(&self, _: &JudgeInput) -> Adjudication {
                 Adjudication::Response("<think>".into())
             }
         }
         let o = run_judge(
             Arc::new(Garbage),
-            &render_prompt("x", 0.2, &[], &[]),
+            &input("x"),
             Duration::from_secs(5),
             &mut t,
         );
@@ -440,7 +495,7 @@ mod tests {
             fn name(&self) -> &str {
                 "slow"
             }
-            fn adjudicate(&self, _: &JudgePrompt) -> Adjudication {
+            fn adjudicate(&self, _: &JudgeInput) -> Adjudication {
                 std::thread::sleep(Duration::from_secs(2));
                 Adjudication::Response("SAFE".into())
             }
@@ -449,7 +504,7 @@ mod tests {
         let start = std::time::Instant::now();
         let o = run_judge(
             Arc::new(Slow),
-            &render_prompt("x", 0.2, &[], &[]),
+            &input("x"),
             Duration::from_millis(50),
             &mut t,
         );
@@ -464,7 +519,7 @@ mod tests {
         let mut t = Tags::default();
         let o = run_judge(
             Arc::new(StubAdjudicator),
-            &render_prompt("x", 0.2, &[], &[]),
+            &input("x"),
             Duration::from_millis(1),
             &mut t,
         );

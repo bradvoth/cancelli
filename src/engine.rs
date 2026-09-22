@@ -12,7 +12,7 @@ use crate::pattern::{self, FiredRule};
 use crate::policy::{self, Mode, Provisional, Verdict};
 use crate::pyre::py_round;
 use crate::resolution::{
-    self, Adjudicator, Final, JudgeOutcome, JudgePrompt, SemAtom, StubAdjudicator,
+    self, Adjudicator, Final, JudgeInput, JudgeOutcome, JudgePrompt, SemAtom, StubAdjudicator,
 };
 use crate::rules;
 use crate::semantic::{self, RiskClass};
@@ -293,9 +293,13 @@ pub fn analyze(cmd: &str, opts: &Options) -> Result<Analysis, EngineError> {
         Verdict::Warn if skip.is_some() => (None, None, Final::Deny),
         Verdict::Warn => {
             let prompt = resolution::render_prompt(cmd, aggregate, &triggered, &rule_ids);
+            let input = JudgeInput {
+                command: cmd.to_string(),
+                prompt: prompt.clone(),
+            };
             let outcome = resolution::run_judge(
                 Arc::clone(&opts.adjudicator),
-                &prompt,
+                &input,
                 opts.judge_timeout,
                 &mut tags,
             );

@@ -48,6 +48,23 @@ enum Cmd {
         /// Operating mode (thresholds).
         #[arg(long, value_enum)]
         mode: Option<ModeArg>,
+        /// A Jev "allow" emits permissionDecision "allow" (D13).
+        #[arg(long)]
+        decide_all: bool,
+    },
+    /// Ask Jev about one command and print the judge record as JSON.
+    Judge {
+        /// The shell command.
+        command: String,
+        /// Session transcript (JSONL) for the user request and prior actions.
+        #[arg(long)]
+        transcript: Option<std::path::PathBuf>,
+        /// User request text (replaces the transcript's prompts).
+        #[arg(long)]
+        request: Option<String>,
+        /// Show `would_emit` as with --decide-all.
+        #[arg(long)]
+        decide_all: bool,
     },
     /// Print the full analysis of one command as JSON.
     Analyze {
@@ -80,7 +97,11 @@ fn main() -> ExitCode {
         }
     };
     match cli.cmd {
-        Cmd::Hook { dry_run, mode } => {
+        Cmd::Hook {
+            dry_run,
+            mode,
+            decide_all,
+        } => {
             // Fail open on panics too: silence the default panic message and
             // log an error record instead.
             std::panic::set_hook(Box::new(|_| {}));
@@ -88,6 +109,7 @@ fn main() -> ExitCode {
             let args = HookArgs {
                 dry_run,
                 mode: mode.map(Mode::from),
+                decide_all,
             };
             let mut stdin = Vec::new();
             let read = std::io::stdin().read_to_end(&mut stdin);
@@ -127,7 +149,7 @@ fn main() -> ExitCode {
                 &env,
                 &CliOverrides {
                     mode: mode.map(Mode::from),
-                    dry_run: false,
+                    ..CliOverrides::default()
                 },
             );
             let opts = Options {
@@ -152,6 +174,27 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Cmd::Judge {
+            command,
+            transcript,
+            request,
+            decide_all,
+        } => {
+            let env = Env::from_process();
+            let rec = hook::judge_cli(&command, transcript, request, decide_all, &env);
+            match serde_json::to_string_pretty(&rec) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    eprintln!("cancelli: {e}");
+                    return ExitCode::FAILURE;
+                }
+            }
+            if rec.error.is_some() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
         Cmd::Config { init } => {
             let env = Env::from_process();
             if init {
@@ -168,7 +211,7 @@ fn main() -> ExitCode {
             } else {
                 print!(
                     "{}",
-                    config::render(&config::load(&env, &CliOverrides::default()))
+                    config::render(&config::load(&env, &CliOverrides::default()), &env)
                 );
                 ExitCode::SUCCESS
             }

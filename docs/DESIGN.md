@@ -15,6 +15,13 @@ Research notes: `docs/research/care-paper-report.md`, `docs/research/care-repo-r
 | D5 | Data | **JSONL, PreToolUse only.** No PostToolUse outcome join. |
 | D6 | Mode | **Dry-run for now** (`--dry-run`): never emits a decision. |
 | D7 | LLM judge on WARN | **Stubbed.** Behind an `Adjudicator` trait; step 2 is a local open-weight model ("Jev"). |
+| D11 | Judge = Jev (2026-09-22) | The WARN adjudicator is **Jev** (the `jev_gate` POC in `~/Documents/tte`, findings in `JEV_GATE_FINDINGS.md`). Jev is the **final decider**, and its tiers map to allow / ask / deny. |
+| D12 | Jev scope | **Jev only sees calls CARE leaves at WARN with no skip predicate firing** (paper Resolution). CARE's static ALLOW and DENY are final and never sent to Jev. |
+| D13 | Jev allow: decide or pass | **Configurable.** `--decide-all` flag / `decide_all = true` in config.toml: a Jev `allow` emits `permissionDecision: "allow"`, which skips Claude Code's prompt. Default `false`: a Jev `allow` emits nothing, so normal permission rules decide. Jev `ask`/`deny` always emit. It applies only to Jev's verdicts; CARE's static ALLOW always passes silently. It has no effect in dry-run. |
+| D14 | Jev tier → verdict | Tiers are evaluated first-match in `docs/research/jev-integration-spec.md` §4.2. **T1** (transport ∧ sensitive ∧ unknown) and **T2** (`f5 > 0.9`) → **deny**. **T3–T5** → **ask**. **T6** (no tier fired) → **allow** (subject to D13). Thresholds are exactly those in the spec, recalibrated later against Claude Code traffic. |
+| D15 | Jev failure | No key, timeout, transport or HTTP error, unparseable response, missing answers, or `response.model != "jev-1.13.0"` all produce **ask**, plus an error record in the log. |
+| D16 | Jev context | **L2 exactly as in the POC** render template (spec §3): proposed action; the user's request from genuine user prompts in the transcript; prior agent tool calls with args verbatim, clipped as in the POC; tool results **never** included (reasoning-blind). |
+| D17 | Jev in dry-run | **Called for real** on unresolved WARNs. The full request state, answers, tier, verdict, latency, usage and request-id are logged. No decision is emitted. |
 | D8 | Crate structure | **Library + thin binary.** All logic (pipeline, hook I/O, logging, config) lives in the lib (`src/lib.rs` + modules); `src/main.rs` only parses CLI args and calls into the lib. |
 | D9 | Install | **`cargo install --path .`** → `~/.cargo/bin/cancelli`; the hook command is `cancelli hook --dry-run`. Nothing may depend on the source checkout at runtime (rules/prompt embedded via `include_str!`). |
 | D10 | Config | **`~/.config/cancelli/config.toml`** (`$XDG_CONFIG_HOME/cancelli/config.toml` if set; deliberately *not* macOS `~/Library/Application Support`). |
@@ -31,12 +38,19 @@ dry_run = true             # the --dry-run flag forces true
 dir = "~/.local/share/cancelli"   # env CANCELLI_LOG_DIR overrides
 max_field_bytes = 4096            # non-Bash string truncation threshold
 
-[judge]                    # step 2; ignored while the stub is active
-backend = "stub"
-# base_url = "http://127.0.0.1:8006/v1"
-# model = ""
-# timeout_ms = 2000
+decide_all = false         # D13; --decide-all forces true
+
+[judge]
+backend = "jev"            # "jev" | "stub"
+base_url = "https://api.typesafe.ai"   # env TYPESAFE_BASE_URL overrides
+model = "jev-1.13.0"       # pinned; response.model must match
+api_key_env = "TYPESAFE_API_KEY"
+# api_key_file = "~/.config/cancelli/jev_api_key"   # 0600; used if the env var is unset
+timeout_ms = 3000          # per request
+budget_ms = 5000           # total incl. one retry on 408/429/5xx; must stay well under the hook timeout
 ```
+
+The key is never written to logs or to config.toml. When `api_key_file` has group or other permissions, it is refused with an error record, and the D15 behaviour applies.
 
 ## Paper-over-repo reconciliations (D1)
 

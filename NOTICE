@@ -48,3 +48,14 @@ The full text of the CARE MIT license:
   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
   FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
   DEALINGS IN THE SOFTWARE.
+
+--------------------------------------------------------------------------
+Jev rubric and fixtures (jev_gate POC)
+--------------------------------------------------------------------------
+`data/jev/v1_policy_distilled.yaml` is vendored verbatim from the jev_gate
+proof of concept (`rubrics/v1_policy_distilled.yaml`, rubric hash
+0fd1f245ae1c7ef3) by the same author. `tests/fixtures/jev/<state_hash>.json`
+are eight cached `jev-1.13.0` responses (answers, model, usage, request id)
+from that POC's cache for the contrastive smoke-gate states, copied verbatim
+for offline replay tests. Jev is a hosted model by TypeSafe AI; no TypeSafe
+code is included.

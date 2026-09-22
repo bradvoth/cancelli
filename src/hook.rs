@@ -7,11 +7,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 
-use crate::config::{self, CliOverrides, Env, Loaded};
+use crate::config::{self, CliOverrides, Config, Env, Loaded};
 use crate::engine::{self, Analysis, Options};
+use crate::jev::client::Transport;
+use crate::jev::decide::Verdict as JevVerdict;
+use crate::jev::transcript::ContextSource;
+use crate::jev::{self, JevAdjudicator};
 use crate::logging;
 use crate::policy::Mode;
-use crate::resolution::{Final, StubAdjudicator};
+use crate::resolution::{Adjudicator, Final, StubAdjudicator};
 use crate::rules;
 
 /// Hook invocation arguments (from the CLI).
@@ -21,6 +25,8 @@ pub struct HookArgs {
     pub dry_run: bool,
     /// `--mode`.
     pub mode: Option<Mode>,
+    /// `--decide-all`.
+    pub decide_all: bool,
 }
 
 /// What the hook prints and how it exits (always 0: fail open).
@@ -66,6 +72,7 @@ pub fn load_config(env: &Env, args: &HookArgs) -> Loaded {
         &CliOverrides {
             mode: args.mode,
             dry_run: args.dry_run,
+            decide_all: args.decide_all,
         },
     );
     for d in &loaded.diagnostics {
@@ -93,16 +100,87 @@ fn str_field(v: &Value, k: &str) -> Value {
     v.get(k).cloned().unwrap_or(Value::Null)
 }
 
-/// Decision JSON for enforce mode (D6: built, not registered).
-pub fn decision_output(a: &Analysis) -> Option<Value> {
+/// Jev settings from the config.
+pub fn jev_settings(c: &Config) -> jev::Settings {
+    jev::Settings {
+        transport: Transport {
+            base_url: c.judge_base_url.clone(),
+            timeout: Duration::from_millis(c.judge_timeout_ms),
+            budget: Duration::from_millis(c.judge_budget_ms),
+        },
+        model: c.judge_model.clone(),
+        decide_all: c.decide_all,
+    }
+}
+
+/// The configured adjudicator and its backstop timeout (FIX-008) for one
+/// hook call.
+pub fn adjudicator(
+    c: &Config,
+    env: &Env,
+    source: ContextSource,
+) -> (Arc<dyn Adjudicator>, Duration) {
+    if c.judge_backend == "stub" {
+        return (
+            Arc::new(StubAdjudicator),
+            Duration::from_millis(c.judge_timeout_ms),
+        );
+    }
+    let adj = JevAdjudicator {
+        settings: jev_settings(c),
+        key: c.api_key(env),
+        source,
+    };
+    (
+        Arc::new(adj),
+        jev::backstop(Duration::from_millis(c.judge_budget_ms)),
+    )
+}
+
+fn emit(decision: &str, reason: String) -> Option<Value> {
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": decision,
+            "permissionDecisionReason": reason,
+        }
+    }))
+}
+
+/// Decision JSON for enforce mode. CARE's static verdicts are unchanged
+/// (D12); a Jev verdict names its tier; a Jev `allow` emits only with
+/// `decide_all` (D13); Jev failures ask (D15).
+pub fn decision_output(a: &Analysis, decide_all: bool) -> Option<Value> {
     let rules: Vec<&str> = a.fired_rules.iter().map(|r| r.id.as_str()).collect();
     let rules = if rules.is_empty() {
         "none".to_string()
     } else {
         rules.join(",")
     };
+    if let Some(j) = a.judge.as_ref().and_then(|o| o.jev.as_ref()) {
+        let care = format!("CARE WARN score {}, rules {}", a.aggregate, rules);
+        let why = match (&j.error, j.tier, j.tier_rule) {
+            (Some(e), _, _) => format!("Jev unavailable ({e})"),
+            (None, Some(t), Some(rule)) => format!("Jev {t}: {rule}"),
+            _ => "Jev".to_string(),
+        };
+        return match j.verdict {
+            JevVerdict::Allow if !decide_all => None,
+            v => emit(
+                v.as_str(),
+                format!("cancelli: {} -> {}; {care}", why, v.as_str()),
+            ),
+        };
+    }
     let (decision, reason) = match a.r#final {
         Final::Allow => return None,
+        Final::Ask => (
+            "ask",
+            format!(
+                "cancelli (CARE): WARN, score {}, judge failed; rules {}",
+                a.aggregate, rules
+            ),
+        ),
         Final::Deny => (
             "deny",
             format!(
@@ -121,13 +199,7 @@ pub fn decision_output(a: &Analysis) -> Option<Value> {
             ),
         ),
     };
-    Some(json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": decision,
-            "permissionDecisionReason": reason,
-        }
-    }))
+    emit(decision, reason)
 }
 
 /// Handle one hook invocation.
@@ -192,11 +264,24 @@ pub fn run(stdin: &[u8], args: &HookArgs, env: &Env) -> HookOutput {
             );
             return empty;
         };
+        let source = ContextSource {
+            transcript_path: payload
+                .get("transcript_path")
+                .and_then(Value::as_str)
+                .filter(|p| !p.is_empty())
+                .map(std::path::PathBuf::from),
+            tool_use_id: payload
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            request_override: None,
+        };
+        let (adjudicator, judge_timeout) = adjudicator(&loaded.config, env, source);
         let opts = Options {
             mode: loaded.config.mode,
             home: env.home.clone().unwrap_or_default(),
-            adjudicator: Arc::new(StubAdjudicator),
-            judge_timeout: Duration::from_millis(loaded.config.judge_timeout_ms),
+            adjudicator,
+            judge_timeout,
         };
         match engine::analyze(cmd, &opts) {
             Err(e) => {
@@ -206,7 +291,26 @@ pub fn run(stdin: &[u8], args: &HookArgs, env: &Env) -> HookOutput {
                 return empty;
             }
             Ok(a) => {
-                let decision = decision_output(&a);
+                if let Some(o) = &a.judge
+                    && let Some(e) = o.error_message()
+                {
+                    let mut extra = Map::new();
+                    extra.insert("session_id".into(), str_field(&payload, "session_id"));
+                    extra.insert("tool_use_id".into(), str_field(&payload, "tool_use_id"));
+                    extra.insert(
+                        "backend".into(),
+                        json!(o.backend.as_deref().unwrap_or("jev")),
+                    );
+                    extra.insert("decision".into(), json!(o.decision.as_str()));
+                    if let Some(j) = &o.jev {
+                        extra.insert("level".into(), json!(j.level));
+                        extra.insert("state_hash".into(), json!(j.state_hash));
+                        extra.insert("request_id".into(), json!(j.request_id));
+                        extra.insert("attempts".into(), json!(j.attempts));
+                    }
+                    log_error(&loaded, "judge", e, extra);
+                }
+                let decision = decision_output(&a, loaded.config.decide_all);
                 rec.insert(
                     "would_emit".into(),
                     json!(
@@ -240,4 +344,34 @@ pub fn run(stdin: &[u8], args: &HookArgs, env: &Env) -> HookOutput {
         stdout.clear();
     }
     HookOutput { stdout }
+}
+
+/// `cancelli judge "<cmd>" [--transcript PATH] [--request TEXT]`: run Jev on
+/// one command (regardless of CARE's verdict) and return the judge record.
+/// Nothing is logged.
+pub fn judge_cli(
+    command: &str,
+    transcript: Option<std::path::PathBuf>,
+    request: Option<String>,
+    decide_all: bool,
+    env: &Env,
+) -> jev::JudgeRecord {
+    let loaded = config::load(
+        env,
+        &CliOverrides {
+            decide_all,
+            ..CliOverrides::default()
+        },
+    );
+    let source = ContextSource {
+        transcript_path: transcript,
+        tool_use_id: None,
+        request_override: request,
+    };
+    jev::judge(
+        command,
+        &source,
+        &jev_settings(&loaded.config),
+        &loaded.config.api_key(env),
+    )
 }

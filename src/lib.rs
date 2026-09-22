@@ -10,6 +10,7 @@ pub mod config;
 pub mod engine;
 pub mod fixes;
 pub mod hook;
+pub mod jev;
 pub mod logging;
 pub mod path;
 pub mod pattern;

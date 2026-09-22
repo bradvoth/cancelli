@@ -1,57 +1,75 @@
-Port CARE to Rust as the `cancelli` PreToolUse hook
+Adjudicate CARE WARNs with Jev (jev-1.13.0) instead of the stub
 
-cancelli is a Rust port of CARE (Canonicalization, Attribution, and
-Resolution Engine; arXiv:2607.21642, reference impl prisma-research/CARE @
-e8166db, MIT) packaged as a Claude Code PreToolUse hook. It scores Bash
-commands through the full CARE pipeline — canonicalization (as views, not
-marker text) -> L1 structure (brush-parser) / L2 semantic / L3 path / L4
-139-rule pattern bank -> L5 aggregation (0.3/0.3/0.3/0.1) -> per-mode
-provisional verdicts (strict 0.10/0.20, balanced 0.15/0.35, auto 0.20/0.50)
--> Resolution skip predicates and a stubbed Adjudicator — and logs one JSONL
-record per PreToolUse event. Non-Bash tools are logged raw (truncated +
-sha256 over 4 KiB). Dry-run always exits 0 with empty stdout; enforce mode is
-built but registered by the user.
+Replaces the stubbed WARN judge with Jev, TypeSafe AI's hosted rubric model,
+as ported from the jev_gate POC (decisions D11-D17). Only Bash commands CARE
+leaves at WARN with no skip predicate reach Jev; CARE's static ALLOW and DENY
+are unchanged (D12).
 
-Structure: library crate with a thin clap binary (D8); `cargo install
---path .` with the rule bank and judge prompt embedded via include_str! (D9);
-config at $XDG_CONFIG_HOME|~/.config/cancelli/config.toml (D10). The
-brush-parser bash parser replaces bashlex (D4); the WARN-band judge is
-stubbed behind an Adjudicator trait (D7).
+Context (D16): the proposed action (`tool: bash`, args = the command), the
+user request from genuine human prompts in the session transcript (a
+documented, unit-tested filter drops tool results, isMeta/compact-summary/
+sidechain records, system reminders, task notifications, local-command
+output and inter-session messages), and prior tool_use calls with args
+verbatim. Tool results and agent prose are never read. The level degrades
+from L2 to L1/L0 when the transcript is missing or does not yet contain the
+current tool_use, and the achieved level is logged. The state uses the POC
+render template byte-for-byte: same headers, 4,000-char clipping,
+12,000-char history budget, decoded-forms section, results never rendered.
 
-Parity: a pinned-reference driver (scripts/parity) generates
-tests/golden/reference.jsonl over a 495-command corpus; a Rust test asserts
-record-by-record parity, and every divergence is attributed to a FIX-/EXT-
-id via tests/golden/allowlist.json (382 identical, 113 attributed). Full unit,
-e2e (real binary + temp log dir) and cargo-install tests; clippy -D warnings
-and fmt clean, no warning suppression.
+Rubric: data/jev/v1_policy_distilled.yaml vendored verbatim via
+include_str!. All 40 axes are parsed, and per-level question selection
+applies `requires` (L0/L1 38, L2 39). A test recomputes rubric_hash with the
+POC's exact algorithm (Python json.dumps separators, sort_keys,
+ensure_ascii=False) and asserts 0fd1f245ae1c7ef3.
 
-Verdict shift: no rule the reference fires is ever missed, but because the
-paper's skip predicates (FIX-001..003) are narrower, 24 corpus commands the
-reference DENYs statically now go to the (stubbed) judge instead, and 9 are
-stricter. Enforcement must not be enabled until a real judge replaces the stub.
+Decision (D14): the POC's signals() with the rubric's declarations, then the
+6-tier first-match rules of the spec, thresholds unchanged. "unknown" is the
+declared a6 argmax predicate, gated on f5 > 0.8. T1/T2 -> deny, T3-T5 -> ask,
+T6 -> allow. A Jev allow emits nothing unless --decide-all / decide_all =
+true (D13). Every failure -> ask plus an error record (D15): no key, key file
+with group/other permissions, transport error, timeout, non-2xx,
+unparseable body, missing answers, or response.model != jev-1.13.0.
 
-Deliberate divergences from the reference (each has a regression test and a
-README row):
+Transport: blocking ureq 3 + rustls, POST {base_url}/v1/systemone with a
+Bearer key (env var named by api_key_env, else a 0600 api_key_file; never
+logged, redacted from errors). 3,000 ms per request, 5,000 ms budget, one
+retry on 408/429/5xx/timeout honouring retry-after(-ms) within the budget.
+Captures x-typesafe-request-id and usage. Dry-run calls Jev for real and
+logs the full judge record (D17); `cancelli judge "<cmd>" [--transcript]
+[--request]` prints the same record; `cancelli config` shows the new keys,
+their sources, and where the key was found.
 
-FIX-001 p_rule uses paper Eq. 9: catalog tiers (mitre, gtfobins), pi*conf >= 0.80.
-FIX-002 p_spath uses paper Eq. 11: write to system/critical tier or any secret access.
-FIX-003 p_sem H_sem uses paper Eq. 10: destructive/priv/exec-chain/persist/network-exfil.
-FIX-004 judge parse is fail-closed: first token SAFE|DANGEROUS, else DENY.
-FIX-005 L1 sees $()/backtick/<() substitutions (dead under bashlex).
-FIX-006 canonicalization produces views instead of polluting layers with marker text.
-FIX-007 padded base64 payloads are decoded (reference regex drops the padding).
-FIX-008 the judge call has a hard timeout and fails closed.
-FIX-009 `git tag` listing is READ_ONLY (reference lexicon conflict).
-FIX-010 L3 treats mkfs.<fs> like mkfs.
-FIX-011 L1 extracts commands from if/for/while/until/case/function bodies.
-FIX-012 brush-parser accepts inputs bashlex rejects ([[ ]], case, $(( )), time).
-FIX-013 pipe-to-interpreter matches the basename of the pipeline tail (| /bin/sh).
-EXT-001 macOS keychain paths are secret-tier.
-EXT-002 macOS /private/{etc,var,tmp} aliases are resolved.
-EXT-003 macOS LaunchAgents/LaunchDaemons/System sensitive-system paths.
-EXT-004 macOS system-root sinks (/System, /Library, /Applications, /Users, /private, /Volumes).
-EXT-005 macOS /dev/diskN and /dev/rdiskN block devices are critical.
-EXT-006 macOS `base64 -D` decode flag triggers payload decoding.
+Also fixes Env::from_process() to skip non-UTF-8 environment variables, so
+one of them can no longer panic the hook before its panic guard.
+
+Tests: the 8 POC smoke-gate states render and hash byte-identically to the
+POC. The POC's real cached responses for them (8 files, screened for
+credentials) replay to the POC's own signals, tiers T6/T2/T6/T2/T6/T2/T6/T5,
+and all 10 smoke checks. The real binary is exercised against a local
+stand-in server for connection refused, hang/timeout, missing key, loose key
+file, wrong model, 503-then-ok and 401 (each: ask, error record, exit 0 in
+dry-run), and for decide_all on/off in enforce mode. The exact request on
+the wire is asserted, and so is the absence of any key, result, prose or
+system-reminder leak. tests/jev_live.rs (ignored) runs the smoke gate and
+one WARN through an installed binary against the real API:
+TYPESAFE_API_KEY=... cargo test --test jev_live -- --ignored
+
+Behaviour change: an unresolved WARN is now `final = "ask"` when Jev fails
+(including with no key) instead of `unadjudicated`; the e2e expectation is
+updated accordingly. backend = "stub" restores the old behaviour.
+
+Deviations from the POC (README "Deviations from the POC"):
+
+JEV-DEV-001 user_request keeps the most recent prompt (POC keeps the oldest 4,000 chars).
+JEV-DEV-002 tool results are never read, so the history budget counts call text only.
+JEV-DEV-003 3 s / 5 s budget / one retry, failures ask (POC: SDK 60 s, 2 retries, 30 s).
+JEV-DEV-004 no answer cache.
+
+CARE divergences carried forward: FIX-004 (first-token parsing) and FIX-008
+(judge timeout) now apply to text judges; Jev's backstop timeout asks.
+Unchanged: FIX-001, FIX-002, FIX-003, FIX-005, FIX-006, FIX-007, FIX-009,
+FIX-010, FIX-011, FIX-012, FIX-013, EXT-001, EXT-002, EXT-003, EXT-004,
+EXT-005, EXT-006.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_015U3NJZXHn92Yg7zAHDKRza
