@@ -119,7 +119,8 @@ fn dry_run_bash_benign_allows() {
     let rec = r.records.iter().find(|r| r["kind"] == "event").unwrap();
     assert_eq!(rec["final"], "allow");
     assert_eq!(rec["aggregate"], 0.0);
-    assert_eq!(rec["would_emit"], Value::Null);
+    // D22: CARE ALLOW would emit an explicit allow (dry-run still prints nothing)
+    assert_eq!(rec["would_emit"], "allow");
 }
 
 #[test]
@@ -338,10 +339,37 @@ fn enforce_mode_warn_emits_ask_json() {
 }
 
 #[test]
-fn enforce_mode_allow_is_silent() {
+fn enforce_mode_care_allow_emits_allow() {
+    // D22: CARE ALLOW emits an explicit allow by default
     let r = run_enforce(
         &["hook"],
         &payload("Bash", serde_json::json!({"command": "ls -la"})),
+    );
+    let v: Value = serde_json::from_str(r.stdout.trim()).unwrap();
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow");
+    let why = v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap();
+    assert!(why.starts_with("cancelli (CARE): ALLOW, score "), "{why}");
+}
+
+#[test]
+fn enforce_mode_allow_is_silent_without_decide_all() {
+    // decide_all = false restores the pass-through (auto-mode profile)
+    let home = TempDir::new().unwrap();
+    let logdir = TempDir::new().unwrap();
+    let cfg = home.path().join(".config/cancelli");
+    std::fs::create_dir_all(&cfg).unwrap();
+    std::fs::write(
+        cfg.join("config.toml"),
+        "dry_run = false\ndecide_all = false\n",
+    )
+    .unwrap();
+    let r = run_in(
+        &["hook"],
+        &payload("Bash", serde_json::json!({"command": "ls -la"})),
+        home.path(),
+        logdir.path(),
     );
     assert_eq!(r.stdout, "");
 }

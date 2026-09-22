@@ -182,8 +182,8 @@ fn emit(decision: &str, reason: String) -> Option<Value> {
 }
 
 /// Decision JSON for a Jev verdict: `deny`/`ask` always, `allow` only with
-/// `decide_all` (D13); the reason names the tier (or the failure, D15) and
-/// what CARE said (`care`).
+/// `decide_all` (D13; on by default, D22). The reason names the tier (or
+/// the failure, D15) and what CARE said (`care`).
 fn jev_output(j: &JudgeRecord, care: &str, decide_all: bool) -> Option<Value> {
     let why = match (&j.error, j.tier, j.tier_rule.as_deref()) {
         (Some(e), _, _) => format!("Jev unavailable ({e})"),
@@ -208,7 +208,8 @@ pub fn unscored_decision_output(o: &JudgeOutcome, reason: &str, decide_all: bool
     }
     let backend = o.backend.as_deref().unwrap_or("judge");
     match o.decision {
-        Final::Allow => None,
+        Final::Allow if !decide_all => None,
+        Final::Allow => emit("allow", format!("cancelli: {backend} -> allow; {care}")),
         Final::Deny => emit("deny", format!("cancelli: {backend} -> deny; {care}")),
         Final::Ask => emit("ask", format!("cancelli: {backend} failed -> ask; {care}")),
         Final::Unadjudicated => emit(
@@ -218,9 +219,9 @@ pub fn unscored_decision_output(o: &JudgeOutcome, reason: &str, decide_all: bool
     }
 }
 
-/// Decision JSON for enforce mode. CARE's static verdicts are unchanged
-/// (D12); a Jev verdict names its tier; a Jev `allow` emits only with
-/// `decide_all` (D13); Jev failures ask (D15).
+/// Decision JSON for enforce mode. CARE DENY denies; CARE ALLOW and a Jev
+/// `allow` emit `allow` only with `decide_all` (D13, default on per D22),
+/// otherwise nothing; a Jev verdict names its tier; Jev failures ask (D15).
 pub fn decision_output(a: &Analysis, decide_all: bool) -> Option<Value> {
     let rules: Vec<&str> = a.fired_rules.iter().map(|r| r.id.as_str()).collect();
     let rules = if rules.is_empty() {
@@ -233,7 +234,16 @@ pub fn decision_output(a: &Analysis, decide_all: bool) -> Option<Value> {
         return jev_output(j, &care, decide_all);
     }
     let (decision, reason) = match a.r#final {
-        Final::Allow => return None,
+        Final::Allow if !decide_all => return None,
+        Final::Allow => (
+            "allow",
+            format!(
+                "cancelli (CARE): ALLOW, score {} [{}], rules {}",
+                a.aggregate,
+                a.provisional.get(a.mode).as_str(),
+                rules
+            ),
+        ),
         Final::Ask => (
             "ask",
             format!(

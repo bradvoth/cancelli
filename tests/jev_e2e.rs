@@ -691,7 +691,7 @@ fn config_shows_jev_keys_and_sources() {
         .unwrap();
     let s = String::from_utf8(out.stdout).unwrap();
     for line in [
-        "decide_all = false  # default",
+        "decide_all = true  # default",
         "judge.backend = \"jev\"  # default",
         "judge.base_url = \"http://127.0.0.1:1\"  # env",
         "judge.model = \"jev-1.13.0\"  # default",

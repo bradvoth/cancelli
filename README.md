@@ -154,7 +154,7 @@ overwrite one), including every `[care]`/`[jev]` tunable commented out (see
 ```toml
 mode = "balanced"          # strict | balanced | auto   (env CANCELLI_MODE)
 dry_run = true             # the --dry-run flag forces true
-decide_all = false         # D13: a Jev "allow" emits allow (skips the prompt); --decide-all forces true
+decide_all = true          # D22: every allow (CARE ALLOW and Jev allow) emits permissionDecision "allow"; false = silent pass-through (auto-mode profile)
 
 [log]
 dir = "~/.local/share/cancelli"   # env CANCELLI_LOG_DIR overrides
@@ -367,7 +367,7 @@ writes the same list as comments):
 | `jev.verdicts.T3` | `"ask"` | verdict for T3 | D14 |
 | `jev.verdicts.T4` | `"ask"` | verdict for T4 | D14 |
 | `jev.verdicts.T5` | `"ask"` | verdict for T5 | D14 |
-| `jev.verdicts.T6` | `"allow"` | verdict when no tier fires (allow still emits only with decide_all, D13) | D14 |
+| `jev.verdicts.T6` | `"allow"` | verdict when no tier fires (an allow emits only while decide_all is on, D13/D22) | D14 |
 | `jev.context.field_chars` | `4000` | clip for args, the user request and each prior call (characters) | POC jev_gate/prepare.py; jev-integration-spec §3.3 |
 | `jev.context.history_chars` | `12000` | history budget for prior calls, newest kept first (characters) | POC jev_gate/prepare.py; jev-integration-spec §3.3 |
 | `jev.context.max_level` | `"L2"` | highest context level: L0 action, L1 +user request, L2 +prior calls | D16; POC jev_gate/context.py |
@@ -521,13 +521,13 @@ Without `--dry-run` (and with `dry_run = false`) the hook emits a decision:
 | Outcome | Emits |
 |---|---|
 | CARE static DENY (score ≥ τ_high, or WARN with a skip predicate) | `deny` |
-| CARE static ALLOW | nothing (normal permission flow) |
+| CARE static ALLOW | `allow` (nothing with `decide_all = false`) |
 | Jev T1/T2 | `deny`, reason names the tier |
 | Jev T3–T5 | `ask`, reason names the tier |
-| Jev T6 | nothing; `allow` only with `decide_all` (D13) |
+| Jev T6 | `allow` (nothing with `decide_all = false`) |
 | Jev failure (D15) | `ask`, reason says Jev was unavailable and why |
 | `backend = "stub"` WARN | `ask` |
-| Call CARE can't score (D21), not in `skip_tools` | as a Jev WARN above: T1/T2 `deny`, T3–T5 `ask`, T6 nothing (`allow` with `decide_all`), failure `ask`, stub `ask` |
+| Call CARE can't score (D21), not in `skip_tools` | as a Jev WARN above: T1/T2 `deny`, T3–T5 `ask`, T6 `allow` (nothing with `decide_all = false`), failure `ask`, stub `ask` |
 | Tool in `[jev] skip_tools` | nothing (normal permission flow) |
 
 Decision D6 keeps the registered hook in dry-run; the Jev thresholds are
@@ -666,19 +666,31 @@ undeclared signals. cancelli always applies the declarations (`requires`,
 `f6_trajectory_escalation` is sent, because it is part of the rubric hash,
 but no tier consumes it (it is inverted on the calibration corpus).
 
-### `decide_all` and auto mode (D13)
+### `decide_all` and permission modes (D13, D22)
 
-By default a Jev **allow** emits nothing, so Claude Code's normal permission
-rules (allow/deny/ask lists, the current mode) decide. With `--decide-all`
-or `decide_all = true`, a Jev allow emits `permissionDecision: "allow"`,
-which **skips the permission prompt**. Jev **ask** and **deny** always emit.
-In practice:
+`decide_all` defaults to **true** (D22): cancelli makes every decision for the
+calls it sees. CARE ALLOW → `allow`, CARE DENY → `deny`, CARE WARN → Jev, and
+Jev allow/ask/deny are emitted as-is. Jev **ask** and **deny**, and CARE
+**deny**, always emit whatever the setting. Tools in `skip_tools` always pass
+through silently. Dry-run never emits anything.
 
-- a hook `"ask"` forces a prompt **even in auto mode**;
+This profile is meant for Claude Code's **`default`** or **`acceptEdits`**
+permission mode. The auto-mode classifier no longer backs up CARE ALLOW, so
+cancelli is the approver for every call it decides. Switch the mode in the
+**same step** as dropping `--dry-run`: in dry-run the hook is silent, and
+in `default`/`acceptEdits` silence means a prompt on nearly every call.
+
+With `decide_all = false`, CARE ALLOW and Jev allow emit nothing, so Claude
+Code's normal permission flow decides. That is the **auto-mode** profile,
+where the auto-mode classifier reviews everything cancelli passes. In every
+mode:
+
+- a hook `"ask"` forces a prompt, **even in auto mode**;
 - a hook `"allow"` skips the prompt, but your settings' **deny and ask rules
-  still apply**, so a hook can't approve past them;
-- `decide_all` only affects Jev verdicts. CARE's static ALLOW always passes
-  silently, and dry-run never emits anything.
+  still apply**, and so does Claude Code's critical-path `rm` circuit breaker;
+  a hook can't approve past them;
+- `skip_tools` calls get no decision, so the mode decides them. In
+  `acceptEdits`, Write/Edit inside the working directory are auto-approved.
 
 ### Failure behaviour (D15)
 

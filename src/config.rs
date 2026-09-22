@@ -201,7 +201,7 @@ pub const DEFAULT_FILE: &str = r#"# cancelli configuration
 
 mode = "balanced"          # strict | balanced | auto   (env CANCELLI_MODE)
 dry_run = true             # the --dry-run flag forces true
-decide_all = false         # D13: a Jev "allow" emits allow (skips the prompt); --decide-all forces true
+decide_all = true          # D22: every allow (CARE ALLOW and Jev allow) emits permissionDecision "allow"; false = silent pass-through (auto-mode profile)
 
 [log]
 dir = "~/.local/share/cancelli"   # env CANCELLI_LOG_DIR overrides
@@ -292,7 +292,7 @@ pub fn load(env: &Env, cli: &CliOverrides) -> Loaded {
     let mut dry_run = true;
     let mut log_dir = DEFAULT_LOG_DIR.to_string();
     let mut max_field_bytes: usize = 4096;
-    let mut decide_all = false;
+    let mut decide_all = true;
     let mut backend = "jev".to_string();
     let mut base_url = DEFAULT_BASE_URL.to_string();
     let mut model = PINNED_MODEL.to_string();
@@ -850,7 +850,7 @@ mod tests {
         let mut env = env_in(d.path());
         let l = load(&env, &CliOverrides::default());
         let c = &l.config;
-        assert!(!c.decide_all);
+        assert!(c.decide_all, "D22: decide_all defaults on");
         assert_eq!(c.judge_backend, "jev");
         assert_eq!(c.judge_base_url, "https://api.typesafe.ai");
         assert_eq!(c.judge_model, "jev-1.13.0");
