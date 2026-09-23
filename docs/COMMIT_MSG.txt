@@ -52,5 +52,11 @@ Tests:
 
 171 offline tests pass. clippy --all-targets and fmt are clean.
 
+Unchanged: FIX-001, FIX-002, FIX-003, FIX-004, FIX-005, FIX-006, FIX-007,
+FIX-008, FIX-009, FIX-010, FIX-011, FIX-012, FIX-013, EXT-001, EXT-002,
+EXT-003, EXT-004, EXT-005, EXT-006, and the Jev deviations JEV-DEV-001,
+JEV-DEV-002, JEV-DEV-003 and JEV-DEV-004. FIX-003's H_sem logic is
+unchanged; only the default set it reads is empty now.
+
 Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_01EkbqW64x7VD293sUMJTFuh
