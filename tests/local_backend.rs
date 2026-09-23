@@ -210,7 +210,7 @@ fn config_shows_and_validates_the_new_judge_keys() {
     assert_ne!(fp(&out), fp(&def));
     assert!(fp(&out).contains("judge.expected_model"));
     assert!(
-        fp(&def).contains("config_fingerprint = 1ae8acec3c61b1b4"),
+        fp(&def).contains("config_fingerprint = 371a6d0ee7fe7bda"),
         "{def}"
     );
     // invalid values fall back with an error naming the key

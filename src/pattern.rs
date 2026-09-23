@@ -41,7 +41,7 @@ pub struct PatternResult {
 /// Match every rule against every view (FIX-006: views replace the
 /// reference's single marker-augmented string).
 pub fn detect(bank: &RuleBank, views: &[View]) -> PatternResult {
-    detect_with(bank, views, &CareTunables::default())
+    detect_with(bank, views, &CareTunables::paper())
 }
 
 /// [`detect`] with tunables: provenance weights π (`care.provenance`) and

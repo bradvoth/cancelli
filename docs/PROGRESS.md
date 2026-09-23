@@ -127,3 +127,10 @@ Constraints: no commit; tte read-only; never touch ~/.config/cancelli, ~/.claude
 - FINAL: 169 offline tests pass (lib 94, docs 2, e2e 19, eval_e2e 5, jev_e2e 17, jev_offline 4, local_backend 8, parity 1, tunables_golden 2, tuning_e2e 17), 3 ignored not run; default fingerprint 1ae8acec3c61b1b4; not committed.
 - Real-log eval (read-only, --offline): h_sem w/o DESTRUCTIVE -> 7 rm -rf p_sem:DESTRUCTIVE denials become needs judge (2 stay deny: score >= tau_high). Control config (defaults + inferred skip_tools): 79 reused Jev answers reproduce every logged tier; CARE identical; only 12 records with no usable answers change.
 - Note: transcript::parse now ignores records after the current tool_use (eval rebuilds from finished transcripts); bad_lines still counted.
+
+# D27 wide-WARN CARE defaults (2026-09-23)
+- Defaults: balanced tau_low 0.04 / tau_high 0.55, h_sem [], SE-P-003 confidence 0.75 (tunables::WIDE_WARN_BALANCED, WIDE_WARN_RULES). CareTunables::paper() / Modes::paper() keep the reference values; parity, engine worked_examples and the eval_e2e fixture use them.
+- Loader: care.modes fallback is the default band; a [care.rules] entry starts from the default override (keys left out keep it), and a confidence equal to the bank's clears it.
+- Default fingerprint 1ae8acec3c61b1b4 -> 371a6d0ee7fe7bda (golden regenerated deliberately).
+- Tuning evidence (offline `cancelli eval` harness, TUNE = procreations train+dev shell + ShellRisk dev, TEST scored once): see DESIGN D27.
+- FINAL: 171 offline tests pass (lib 96, docs 2, e2e 19, eval_e2e 5, jev_e2e 17, jev_offline 4, local_backend 8, parity 1, tunables_golden 2, tuning_e2e 17); clippy --all-targets and fmt clean.

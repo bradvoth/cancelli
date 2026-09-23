@@ -12,6 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use cancelli::engine::{self, Options};
 use cancelli::fixes::{self, Detection};
+use cancelli::tunables::CareTunables;
 use serde_json::Value;
 
 const HOME: &str = "/home/user";
@@ -30,6 +31,7 @@ fn read_corpus() -> Vec<String> {
 fn ours(cmd: &str) -> (Value, Vec<String>) {
     let opts = Options {
         home: HOME.into(),
+        care: CareTunables::paper(),
         ..Options::default()
     };
     let a = engine::analyze(cmd, &opts).expect("analyze");

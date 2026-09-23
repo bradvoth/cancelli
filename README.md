@@ -196,10 +196,12 @@ Every numeric knob of CARE and of the Jev adjudicator can be set in
 `config.toml`, under `[care]` (decision D18) and `[jev]` (D19). Lexicons, path
 catalogs and regexes stay embedded. The guardrails (D20):
 
-- **Defaults are today's behaviour.** An empty or absent config changes
-  nothing. The parity suite, the Jev fidelity/offline tests and the smoke
-  replays run on the defaults, and `tests/golden/tunables_default.json` pins
-  the default values (and their fingerprint, `1ae8acec3c61b1b4`), so any
+- **Defaults are pinned.** An empty or absent config gives the built-in
+  defaults: the paper's values except the D27 wide-WARN keys (see
+  [Tunables](#tunables)). The parity suite runs on `CareTunables::paper()`;
+  the Jev fidelity/offline tests and the smoke replays run on the defaults.
+  `tests/golden/tunables_default.json` pins
+  the default values (and their fingerprint, `371a6d0ee7fe7bda`), so any
   drift of a default fails a test.
 - **Validated per key, fail open.** Weights must be finite and ≥ 0.
   Probabilities, scores and thresholds must be in [0, 1], and
@@ -235,7 +237,7 @@ tau_high = 0.30            # rsync -avz ./data user@host:/backup/ (0.345): WARN 
 gtfobins = 0.90            # π·conf 0.90·0.90 = 0.81 >= θ_rule: GTFOBins shells skip the judge (p_rule)
 
 [care.rules."SE-P-103"]    # cross-host file transfer
-enabled = false            # rsync/scp to user@host no longer fire L4 (0.345 -> 0.12, ALLOW)
+enabled = false            # rsync/scp to user@host no longer fire L4 (0.345 -> 0.12, still WARN under D27)
 
 [care.rules]
 "SE-P-013" = { confidence = 0.60 }   # inline-table form of the same thing
@@ -331,13 +333,13 @@ writes the same list as comments):
 | `care.weights.struct` | `0.1` | L5 weight of δ_struct (L1 structure) | paper Eq. 6, App. A.5; care/policy.py:15-18 |
 | `care.modes.strict.tau_low` | `0.1` | strict: ALLOW below this score | paper Eq. 7; care/modes.py:32-55 |
 | `care.modes.strict.tau_high` | `0.2` | strict: DENY at or above this score | paper Eq. 7; care/modes.py:32-55 |
-| `care.modes.balanced.tau_low` | `0.15` | balanced: ALLOW below this score | paper Eq. 7; care/modes.py:32-55 |
-| `care.modes.balanced.tau_high` | `0.35` | balanced: DENY at or above this score | paper Eq. 7; care/modes.py:32-55 |
+| `care.modes.balanced.tau_low` | `0.04` | balanced: ALLOW below this score | D27 wide-WARN default (paper Eq. 7: 0.15/0.35) |
+| `care.modes.balanced.tau_high` | `0.55` | balanced: DENY at or above this score | D27 wide-WARN default (paper Eq. 7: 0.15/0.35) |
 | `care.modes.auto.tau_low` | `0.2` | auto: ALLOW below this score | paper Eq. 7; care/modes.py:32-55 |
 | `care.modes.auto.tau_high` | `0.5` | auto: DENY at or above this score | paper Eq. 7; care/modes.py:32-55 |
 | `care.resolution.theta_rule` | `0.8` | p_rule: a mitre/gtfobins rule with π·conf >= this skips the judge | paper App. A.6; care/resolution.py:44 (FIX-001) |
 | `care.resolution.theta_sem` | `0.7` | p_sem: an H_sem atom scoring >= this skips the judge | paper App. A.6; care/resolution.py:45 |
-| `care.resolution.h_sem` | `["NETWORK_FETCH", "EXECUTION_CHAIN", "PRIVILEGE_OR_PERMISSION", "PERSISTENCE", "DESTRUCTIVE"]` | L2 classes that can fire p_sem | paper App. A.6 H_sem (FIX-003) |
+| `care.resolution.h_sem` | `[]` | L2 classes that can fire p_sem | D27 wide-WARN default (paper App. A.6 H_sem, FIX-003, has 5 classes) |
 | `care.provenance.mitre` | `1.0` | π for MITRE-tier rules (L4 score and p_rule) | paper App. A.4; care/pattern.py PROVENANCE_TIER_WEIGHT |
 | `care.provenance.gtfobins` | `0.85` | π for GTFOBins-tier rules | paper App. A.4; care/pattern.py PROVENANCE_TIER_WEIGHT |
 | `care.provenance.manual` | `0.6` | π for manual-tier rules | paper App. A.4; care/pattern.py PROVENANCE_TIER_WEIGHT |
@@ -387,9 +389,26 @@ writes the same list as comments):
 | `judge.expected_model` | `"jev-1.13.0"` | response.model the /v1/systemone backend must report; anything else asks (D15) | D23 |
 | `judge.calibration_file` | (none) | per-axis calibration (JSON) pinned to rubric_hash + model; invalid or mismatched asks (fingerprinted by the file's sha256) | D24 |
 | `care.rules."SE-P-NNN".enabled` | `true` | `false` removes the rule from L4 matching and from p_rule | D18 |
-| `care.rules."SE-P-NNN".confidence` | the bank's value | replaces the rule's confidence in L4 (π·conf) and in p_rule | data/rule_provenance.json (care/rules/rule_provenance.json) |
+| `care.rules."SE-P-NNN".confidence` | the bank's value (`SE-P-003`: `0.75`, D27) | replaces the rule's confidence in L4 (π·conf) and in p_rule | data/rule_provenance.json (care/rules/rule_provenance.json) |
 
-The default of `care.resolution.h_sem` is the paper's set (FIX-003).
+**Defaults (D27, wide-WARN profile).** The built-in defaults are the paper's
+values except for four keys: balanced `tau_low = 0.04` / `tau_high = 0.55`,
+`h_sem = []` (no class-only auto-deny; `sudo`, `rm -rf node_modules` and
+`curl` WARN to the judge), and `SE-P-003` (rm -rf on a system dir) at
+confidence `0.75`, below θ_rule. Only read-only commands are allowed without
+the judge, and DENY is left to the path/rule predicates and high scores.
+To get the paper's behaviour back (it is what `tests/parity.rs` checks):
+
+```toml
+[care.modes.balanced]
+tau_low = 0.15
+tau_high = 0.35
+[care.resolution]
+h_sem = ["NETWORK_FETCH", "EXECUTION_CHAIN", "PRIVILEGE_OR_PERMISSION", "PERSISTENCE", "DESTRUCTIVE"]
+[care.rules]
+"SE-P-003" = { confidence = 0.95 }
+```
+
 `care.rules` accepts either `[care.rules."SE-P-103"]` tables or inline tables
 under `[care.rules]`. `enabled = false` removes the rule from L4 matching and
 so from `p_rule`. `confidence` feeds both L4 (π·conf) and `p_rule`. The

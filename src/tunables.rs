@@ -91,17 +91,32 @@ pub struct Modes {
     pub auto: Band,
 }
 
+/// D27: the default balanced band (wide WARN). Only read-only heads fall
+/// below τ_low; τ_high keeps DENY for a high-precision core. Paper: 0.15/0.35.
+pub const WIDE_WARN_BALANCED: Band = Band {
+    tau_low: 0.04,
+    tau_high: 0.55,
+};
+
 impl Default for Modes {
     fn default() -> Self {
+        Modes {
+            balanced: WIDE_WARN_BALANCED,
+            ..Modes::paper()
+        }
+    }
+}
+
+impl Modes {
+    /// The paper's bands (Eq. 7) for every mode.
+    pub fn paper() -> Self {
         Modes {
             strict: Band::of(Mode::Strict),
             balanced: Band::of(Mode::Balanced),
             auto: Band::of(Mode::Auto),
         }
     }
-}
 
-impl Modes {
     /// The band of a mode.
     pub fn get(&self, m: Mode) -> Band {
         match m {
@@ -276,11 +291,41 @@ fn sorted_classes(v: &[RiskClass]) -> Vec<RiskClass> {
         .collect()
 }
 
+/// D27: default per-rule overrides. SE-P-003 (rm -rf on a system dir) drops
+/// below θ_rule so it WARNs to the judge unless its score reaches τ_high.
+pub const WIDE_WARN_RULES: &[(&str, f64)] = &[("SE-P-003", 0.75)];
+
+/// D27: the built-in defaults are the wide-WARN profile: the paper's values
+/// ([`CareTunables::paper`]) with the balanced band [`WIDE_WARN_BALANCED`],
+/// an empty H_sem (no class-only auto-deny) and [`WIDE_WARN_RULES`].
 impl Default for CareTunables {
     fn default() -> Self {
         CareTunables {
-            weights: Weights::default(),
             modes: Modes::default(),
+            h_sem: Vec::new(),
+            rules: WIDE_WARN_RULES
+                .iter()
+                .map(|&(id, c)| {
+                    (
+                        id.to_string(),
+                        RuleOverride {
+                            enabled: true,
+                            confidence: Some(c),
+                        },
+                    )
+                })
+                .collect(),
+            ..CareTunables::paper()
+        }
+    }
+}
+
+impl CareTunables {
+    /// The paper / Python-reference values (parity, tests/parity.rs).
+    pub fn paper() -> Self {
+        CareTunables {
+            weights: Weights::default(),
+            modes: Modes::paper(),
             theta_rule: THETA_RULE,
             theta_sem: THETA_SEM,
             h_sem: sorted_classes(H_SEM_PAPER),
@@ -291,9 +336,7 @@ impl Default for CareTunables {
             rules: BTreeMap::new(),
         }
     }
-}
 
-impl CareTunables {
     /// Is the rule matched at all?
     pub fn rule_enabled(&self, id: &str) -> bool {
         self.rules.get(id).is_none_or(|o| o.enabled)
@@ -495,6 +538,7 @@ pub struct Knob {
 
 const P_WEIGHTS: &str = "paper Eq. 6, App. A.5; care/policy.py:15-18";
 const P_MODES: &str = "paper Eq. 7; care/modes.py:32-55";
+const P_WIDE_WARN: &str = "D27 wide-WARN default (paper Eq. 7: 0.15/0.35)";
 const P_CLASS: &str = "care/common.py:28-39 CLASS_BASE_SCORE";
 const P_STRUCT: &str = "paper App. A.1; care/structure.py scoring ladder";
 const P_PATH: &str = "care/path.py:151-245 PathValidator.validate";
@@ -538,12 +582,12 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         key: "care.modes.balanced.tau_low",
         doc: "balanced: ALLOW below this score",
-        source: P_MODES,
+        source: P_WIDE_WARN,
     },
     Knob {
         key: "care.modes.balanced.tau_high",
         doc: "balanced: DENY at or above this score",
-        source: P_MODES,
+        source: P_WIDE_WARN,
     },
     Knob {
         key: "care.modes.auto.tau_low",
@@ -568,7 +612,7 @@ pub const KNOBS: &[Knob] = &[
     Knob {
         key: "care.resolution.h_sem",
         doc: "L2 classes that can fire p_sem",
-        source: "paper App. A.6 H_sem (FIX-003)",
+        source: "D27 wide-WARN default (paper App. A.6 H_sem, FIX-003, has 5 classes)",
     },
     Knob {
         key: "care.provenance.mitre",
@@ -1117,7 +1161,7 @@ fn load_care(t: &Table, rd: &mut Rd<'_>) -> CareTunables {
             };
             let p = format!("care.modes.{}", mode.as_str());
             rd.unknown(mt, &p, &["tau_low", "tau_high"]);
-            let def = Band::of(mode);
+            let def = c.modes.get(mode);
             let mut b = def;
             rd.num(mt, &p, "tau_low", Range::Unit, &mut b.tau_low);
             rd.num(mt, &p, "tau_high", Range::Unit, &mut b.tau_high);
@@ -1277,8 +1321,10 @@ fn load_care(t: &Table, rd: &mut Rd<'_>) -> CareTunables {
                 continue;
             };
             rd.unknown(tbl, &key, &["enabled", "confidence"]);
+            // Keys left out keep the built-in default (which may itself be
+            // an override, D27); a value equal to the bank's clears it.
             let mut o = RuleOverride {
-                enabled: true,
+                enabled: c.rule_enabled(id),
                 confidence: None,
             };
             if let Some(e) = tbl.get("enabled") {
@@ -1291,13 +1337,15 @@ fn load_care(t: &Table, rd: &mut Rd<'_>) -> CareTunables {
                     None => rd.error(&k, format!("{e} is not a boolean")),
                 }
             }
-            let mut conf = bank_rule.confidence;
+            let mut conf = c.rule_confidence(id, bank_rule.confidence);
             rd.num(tbl, &key, "confidence", Range::Unit, &mut conf);
             if conf != bank_rule.confidence {
                 o.confidence = Some(conf);
             }
             if !o.enabled || o.confidence.is_some() {
                 c.rules.insert(id.clone(), o);
+            } else {
+                c.rules.remove(id);
             }
         }
     }
@@ -1747,9 +1795,10 @@ pub fn init_template() -> String {
     if let Ok(bank) = rules::bank() {
         for r in &bank.rules {
             out.push_str(&format!(
-                "# \"{}\" = {{ enabled = true, confidence = {:?} }}  # {} {}: {}\n",
+                "# \"{}\" = {{ enabled = {}, confidence = {:?} }}  # {} {}: {}\n",
                 r.id,
-                r.confidence,
+                def.care.rule_enabled(&r.id),
+                def.care.rule_confidence(&r.id, r.confidence),
                 r.tier.as_str(),
                 r.family,
                 r.description
@@ -1810,14 +1859,39 @@ mod tests {
     fn defaults_are_the_builtin_constants() {
         let t = Tunables::default();
         assert_eq!(t.care.weights.sem, 0.30);
+        // D27 wide-WARN profile on top of the paper values.
         assert_eq!(
             t.care.modes.balanced,
+            Band {
+                tau_low: 0.04,
+                tau_high: 0.55
+            }
+        );
+        assert_eq!(t.care.modes.strict, Band::of(Mode::Strict));
+        assert_eq!(t.care.modes.auto, Band::of(Mode::Auto));
+        assert!(t.care.h_sem.is_empty());
+        assert_eq!(t.care.rule_confidence("SE-P-003", 0.95), 0.75);
+        assert_eq!(t.care.rules.len(), 1);
+        let p = CareTunables::paper();
+        assert_eq!(
+            p.modes.balanced,
             Band {
                 tau_low: 0.15,
                 tau_high: 0.35
             }
         );
-        assert_eq!(t.care.h_sem.len(), 5);
+        assert_eq!(p.h_sem.len(), 5);
+        assert!(p.rules.is_empty());
+        assert_eq!(
+            CareTunables {
+                modes: t.care.modes,
+                h_sem: t.care.h_sem.clone(),
+                rules: t.care.rules.clone(),
+                ..p
+            },
+            t.care,
+            "the default differs from the paper only in the D27 keys"
+        );
         assert_eq!(
             t.jev.verdicts.map(|v| v.as_str()),
             ["deny", "deny", "ask", "ask", "ask", "allow"]
@@ -1829,22 +1903,60 @@ mod tests {
             );
         }
         assert!(t.overrides().is_empty());
-        let keys: Vec<String> = t.entries().into_iter().map(|(k, _)| k).collect();
+        // Per-rule keys (D27 default overrides) are documented separately.
+        let keys: Vec<String> = t
+            .entries()
+            .into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| !k.starts_with("care.rules."))
+            .collect();
         let knobs: Vec<&str> = KNOBS.iter().map(|k| k.key).collect();
         assert_eq!(keys, knobs, "KNOBS documents every key, in order");
+    }
+
+    /// D27: a rule key left out keeps the default override; a value equal
+    /// to the bank's clears it; the paper profile is one file away.
+    #[test]
+    fn rule_overrides_merge_with_the_default() {
+        let key = "care.rules.\"SE-P-003\".confidence".to_string();
+        let (l, d) = load_str("[care.rules]\n\"SE-P-003\" = { enabled = true }\n");
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(l.tunables.care.rule_confidence("SE-P-003", 0.95), 0.75);
+        assert!(l.tunables.overrides().is_empty());
+
+        let (l, _) = load_str("[care.rules]\n\"SE-P-003\" = { confidence = 0.95 }\n");
+        assert!(l.tunables.care.rules.is_empty());
+        assert_eq!(l.tunables.overrides(), vec![key.clone()]);
+
+        let (l, _) = load_str("[care.rules]\n\"SE-P-003\" = { enabled = false }\n");
+        let o = &l.tunables.care.rules["SE-P-003"];
+        assert!(!o.enabled);
+        assert_eq!(o.confidence, Some(0.75));
+
+        let (l, d) = load_str(
+            "[care.modes.balanced]\ntau_low = 0.15\ntau_high = 0.35\n\
+             [care.resolution]\nh_sem = [\"NETWORK_FETCH\", \"EXECUTION_CHAIN\", \
+             \"PRIVILEGE_OR_PERMISSION\", \"PERSISTENCE\", \"DESTRUCTIVE\"]\n\
+             [care.rules]\n\"SE-P-003\" = { confidence = 0.95 }\n",
+        );
+        assert!(d.is_empty(), "{d:?}");
+        assert_eq!(l.tunables.care, CareTunables::paper());
     }
 
     #[test]
     fn per_key_fallback_and_errors_name_the_key() {
         let (l, d) = load_str(
-            "[care.weights]\nsem = -1\npath = 0.5\n[care.modes.balanced]\ntau_low = 0.4\n\
+            "[care.weights]\nsem = -1\npath = 0.5\n[care.modes.balanced]\ntau_low = 0.6\n\
              [care.rules.\"SE-P-999\"]\nenabled = false\n[care.rules.\"bogus\"]\nenabled = false\n\
              [jev.tiers]\norder = [\"T1\", \"T9\"]\n[jev.verdicts]\nT7 = \"deny\"\n",
         );
         let c = &l.tunables.care;
         assert_eq!(c.weights.sem, 0.30);
         assert_eq!(c.weights.path, 0.5, "the rest of the section applies");
-        assert_eq!(c.modes.balanced, Band::of(Mode::Balanced));
+        assert_eq!(
+            c.modes.balanced, WIDE_WARN_BALANCED,
+            "falls back to the default"
+        );
         assert_eq!(l.tunables.jev.tier_order.len(), 5);
         let errs: Vec<&str> = d
             .iter()

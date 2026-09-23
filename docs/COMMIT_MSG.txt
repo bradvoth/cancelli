@@ -1,101 +1,56 @@
-Judge any /v1/systemone server, calibrate it, and replay logs (D23-D25)
+Default CARE to the wide-WARN profile (D27)
 
-D23: the judge backend is any /v1/systemone-compatible server (e.g.
-jev-rs on llama-server), not only api.typesafe.ai. The backend keeps the
-name "jev" (no alias). New [judge] keys:
+CARE now denies only what is almost certainly a risk, and allows only
+read-only commands. Everything else is a WARN that Jev decides. The
+built-in defaults differ from the paper in four keys:
 
-- expected_model (default "jev-1.13.0") replaces the hard-coded
-  PINNED_MODEL check: a response reporting another model is a D15 failure
-  (ask plus an error record). It is a tunable, validated on its own (an
-  empty or padded name falls back with an error), fingerprinted, listed in
-  `config`, and written commented by `config --init`. The constant is now
-  client::DEFAULT_EXPECTED_MODEL. The load-time warning about judge.model
-  is gone. A non-default expected_model without a calibration file warns.
-- api_key_required (default true): false makes a missing key fine and sends
-  no Authorization header. A key that is found is still sent. It is a
-  transport setting like timeout_ms (shown in `config`, written by
-  `--init`).
+- care.modes.balanced: tau_low 0.15 -> 0.04, tau_high 0.35 -> 0.55
+- care.resolution.h_sem: the paper's five classes -> [] (no class-only
+  auto-deny; sudo, rm -rf node_modules and curl go to Jev)
+- care.rules."SE-P-003" (rm -rf on a system dir): confidence 0.95 -> 0.75,
+  below theta_rule, so it no longer fires p_rule
 
-Every judge record logs backend_host (host:port of base_url, never
-userinfo), expected_model and the reported model. The judge error record
-carries backend_host.
+DENY now comes from p_spath, p_rule and aggregates >= 0.55. Strict and
+auto keep the paper bands.
 
-D24: optional per-axis calibration, `[judge] calibration_file` (JSON,
-format "cancelli-calibration/1": rubric_hash, model, fitted_at, source,
-axes{id: {type, method, params, n, metrics?}}). noul answers use Platt
-(p' = sigmoid(a*logit(p)+b)), choice and score answers a temperature on the
-log-probabilities, renormalised (score = sum k*p'_k, choice = argmax).
-`method` is a serde tag, so isotonic can be added later. Calibration
-applies after the completeness check and before signal extraction
-(jev::evaluate). The file is validated at load against the rubric in use
-and expected_model, and per call against the reported model. An
-unreadable, invalid or mismatched file refuses calibration: a config error
-record, and every judge call asks with a judge error record. Uncalibrated
-answers are never used silently. The record keeps the raw `answers` and
-adds `answers_calibrated` and `calibration{file, sha, rubric_hash, model,
-fitted_at, axes}`. calibration_file is fingerprinted by the file's sha256.
+Evidence (offline replay through `cancelli eval`). The candidates were
+tuned on the procreations train+dev shell items and ShellRisk dev. The
+held-out sets were scored once, after the candidates were frozen:
 
-`cancelli calibrate --reference <files...> --out <file>` fits the file from
-tte run rows, cancelli judge records (Jev answers + state; the configured
-backend is queried with each state and exactly the questions Jev answered)
-or pair lines (--offline; --pairs-out writes them for refitting). Platt
-minimises cross-entropy against Jev's p as a soft target (Newton); the
-temperature minimises the summed KL (golden section over 1/t). A fixed
-seeded split (--holdout 0.25, --seed 42) fits on one part and reports
-Brier and ECE before->after on the held-out part only. Items from another
-rubric, non-Jev references and duplicate states are skipped and counted.
-Online calibration refuses to run while expected_model is jev-1.13.0.
+                        risky allowed   safe blocked    WARN (to Jev)
+  procreations holdout  1/81  (34/81)   0/82 (22/82)    81.6% (2.5%)
+  ShellRisk test        14/193 (147/193) 12/4001 (72/4001) 60.9% (5.3%)
+  2,909 real Bash calls         -              -        47.8% (2.4%)
 
-D25: `cancelli eval --logs <files...> --config <path> [--offline] [--json]`
-replays logged calls through hook::evaluate_call, the hook's own decision
-function (split out of hook::run, which now only parses, writes and
-prints). Only the judge differs: eval::ReplayJudge reuses the logged answers
-when the state, rubric and backend (host + expected_model) are unchanged,
-otherwise resends the logged state, or rebuilds the state from the
-transcript for calls that newly reach the judge. --offline never queries
-and never reads the key. Truncated non-Bash inputs without a logged state
-are reported as "input truncated". Older records (no final/would_emit,
-stub-era unadjudicated, pre-D23 records without backend_host) get a
-best-effort old decision noted in `why`. Output: summary, old->new
-transition matrix, and the changed calls sorted by time with reasons (CARE
-mode/verdict/score/skip/rules, newly/no longer judged, tier, calibration,
-answer source). --json prints one object per record plus a summary line.
-config::load_from loads an explicit config path; its default key file is
-next to that path. transcript::parse ignores records after the current
-tool_use, so rebuilt states only see what preceded the call (hook states
-are unchanged: at hook time the call is not yet written).
+(Paper defaults in parentheses.) The cost is Jev load: Jev's own miss
+rate now dominates.
 
-Default config_fingerprint: 2654a8f1b09ee5cc -> 1ae8acec3c61b1b4 (two new
-tunables, judge.expected_model and judge.calibration_file;
-tests/golden/tunables_default.json regenerated). Every other default is
-unchanged; parity, the Jev fidelity/offline tests and all pre-existing e2e
-tests pass unmodified (tunables_golden's README check exempts
-judge.calibration_file like jev.rubric_file; jev_live follows the renamed
-constant and client::post's Option<&Secret>).
+Code:
+- CareTunables::paper() and Modes::paper() keep the reference values.
+  Default is paper plus WIDE_WARN_BALANCED, an empty h_sem and
+  WIDE_WARN_RULES. pattern::detect (bank semantics) uses paper().
+- Loader: an invalid care.modes value falls back to the default band, not
+  the paper's. A [care.rules] entry starts from the default override (keys
+  left out keep it), and a confidence equal to the bank's clears it, so
+  the paper profile is one config file away (README has it).
+- `config --init` writes the effective default per rule.
 
-Tests: tests/local_backend.rs (8) drives the real binary against a local
-replay server serving real cached jev-1.13.0 answers as "qwen-local": the
-expected model is accepted and a different one asks with an error record;
-no key means no Authorization header, and a present key is still sent;
-config/--init/fingerprint/validation of the new keys; calibration moves f5
-and the tier both ways (T6->T2 deny, T5->T6 allow); mismatched model or
-rubric, invalid JSON and a missing file each ask with config and judge
-error records; calibrate --offline recovers Platt(1.5, -0.7) and t = 0.6
-from synthetic pairs within 0.01 with lower held-out Brier/ECE; and online
-calibrate queries the server for tte rows and a log record, then refits
-the saved pairs offline to the same parameters. tests/eval_e2e.rs (5): a
-hook-written log plus older-format records gives exact transitions under a
-modified config offline, with the replay server (a rebuilt state is sent),
-and against a different backend (the logged states are resent verbatim).
-The same config replays with no change, and the text output is sorted and
-stable. Unit tests cover the calibration file, the transforms, the fitters,
-metrics, the seeded shuffle, host_of, truncation detection, old-decision
-inference and the transcript cut-off.
+Tests:
+- tests/parity.rs, the engine's worked examples and the eval_e2e fixture
+  pin CareTunables::paper() / the paper keys, so parity with the Python
+  reference is still checked. This amends D20: parity no longer runs on
+  the defaults.
+- New: engine wide_warn_defaults (sudo, rm -rf node_modules and /var/lib,
+  force-with-lease and cp WARN; rm -rf /etc denies via p_spath; curl | bash
+  via p_rule) and tunables rule_overrides_merge_with_the_default (the
+  paper profile loads back exactly).
+- The tuning_e2e knob tests that went ALLOW -> WARN now go WARN -> ALLOW,
+  and still show a verdict change from the defaults. The h_sem test now
+  adds DESTRUCTIVE to get the deny back.
+- Default config_fingerprint 1ae8acec3c61b1b4 -> 371a6d0ee7fe7bda; golden
+  regenerated deliberately.
 
-Unchanged: FIX-001, FIX-002, FIX-003, FIX-004, FIX-005, FIX-006, FIX-007,
-FIX-008, FIX-009, FIX-010, FIX-011, FIX-012, FIX-013, EXT-001, EXT-002,
-EXT-003, EXT-004, EXT-005, EXT-006, and the Jev deviations JEV-DEV-001,
-JEV-DEV-002, JEV-DEV-003 and JEV-DEV-004.
+171 offline tests pass. clippy --all-targets and fmt are clean.
 
-Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_015U3NJZXHn92Yg7zAHDKRza
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EkbqW64x7VD293sUMJTFuh

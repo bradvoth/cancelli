@@ -16,6 +16,14 @@ use tempfile::TempDir;
 
 const WARN_CMD: &str = "rsync -avz ./data user@host:/backup/";
 
+/// The paper's CARE values for the D27 keys. The fixture log is generated
+/// under them (so `rm -rf node_modules` is a p_sem:DESTRUCTIVE deny), and
+/// every replay config starts from them.
+const PAPER_BAND: &str = "[care.modes.balanced]\ntau_low = 0.15\ntau_high = 0.35\n\
+                          [care.rules]\n\"SE-P-003\" = { confidence = 0.95 }\n";
+const PAPER_H_SEM: &str = "[care.resolution]\nh_sem = [\"NETWORK_FETCH\", \"EXECUTION_CHAIN\", \
+                           \"PRIVILEGE_OR_PERMISSION\", \"PERSISTENCE\", \"DESTRUCTIVE\"]\n";
+
 /// The calls of the session, in transcript order: (tool_use_id, tool, input).
 fn calls() -> Vec<(&'static str, &'static str, Value)> {
     vec![
@@ -109,7 +117,10 @@ fn fixture() -> Fixture {
     std::fs::create_dir_all(&cfg).unwrap();
     std::fs::write(
         cfg.join("config.toml"),
-        format!("[judge]\nbase_url = \"{}\"\n", srv.url),
+        format!(
+            "{PAPER_BAND}{PAPER_H_SEM}[judge]\nbase_url = \"{}\"\n",
+            srv.url
+        ),
     )
     .unwrap();
     let transcript = home.path().join("session.jsonl");
@@ -202,7 +213,7 @@ fn modified_config(f: &Fixture) -> PathBuf {
     f.config(
         "modified.toml",
         &format!(
-            "[care.resolution]\n\
+            "{PAPER_BAND}[care.resolution]\n\
              h_sem = [\"NETWORK_FETCH\", \"EXECUTION_CHAIN\", \"PRIVILEGE_OR_PERMISSION\", \"PERSISTENCE\"]\n\
              [jev]\nskip_tools = [\"Read\"]\n[jev.thresholds]\nf5_ask = 0.8\n\
              [judge]\nbase_url = \"{}\"\n",
@@ -298,7 +309,11 @@ fn offline_eval_reports_exact_transitions() {
     assert_eq!(
         s["overrides"],
         json!([
+            // the paper pins differ from the D27 defaults
+            "care.modes.balanced.tau_high",
+            "care.modes.balanced.tau_low",
             "care.resolution.h_sem",
+            "care.rules.\"SE-P-003\".confidence",
             "jev.skip_tools",
             "jev.thresholds.f5_ask"
         ])
@@ -349,7 +364,7 @@ fn a_different_backend_gets_the_logged_states_resent() {
     let cfg = f.config(
         "local.toml",
         &format!(
-            "[judge]\nbase_url = \"{}\"\nexpected_model = \"qwen-local\"\napi_key_required = false\n",
+            "{PAPER_BAND}{PAPER_H_SEM}[judge]\nbase_url = \"{}\"\nexpected_model = \"qwen-local\"\napi_key_required = false\n",
             local.url
         ),
     );
@@ -411,7 +426,10 @@ fn same_config_replays_to_no_changes() {
     // exactly the generation config, as a file
     let cfg = f.config(
         "same.toml",
-        &format!("[judge]\nbase_url = \"{}\"\n", f.srv.url),
+        &format!(
+            "{PAPER_BAND}{PAPER_H_SEM}[judge]\nbase_url = \"{}\"\n",
+            f.srv.url
+        ),
     );
     let (by, s) = f.eval_json(&cfg, true);
     for id in [

@@ -324,8 +324,9 @@ fn rules_disabling_se_p_103_changes_fired_rules_and_verdict() {
     assert!(fired(ev).is_empty());
     assert_eq!(ev["layers"]["L4"]["score"], 0.0);
     assert_eq!(ev["aggregate"], 0.12);
-    assert_eq!(ev["provisional"]["balanced"], "ALLOW");
-    assert_eq!(ev["final"], "allow");
+    // D27: 0.12 is above the default τ_low 0.04, so it still WARNs.
+    assert_eq!(ev["provisional"]["balanced"], "WARN");
+    assert_eq!(ev["final"], "ask");
     assert_eq!(overrides(ev), vec!["care.rules.\"SE-P-103\".enabled"]);
     // A confidence override feeds both L4 and p_rule (π_mitre 1.0 · 0.85 >= 0.80).
     let r = care(
@@ -368,43 +369,48 @@ fn resolution_theta_rule_theta_sem_and_h_sem() {
     );
     assert_eq!(r.event()["skip_predicate"], "p_rule:SE-P-108");
     assert_eq!(r.event()["final"], "deny");
-    // θ_sem 0.6: EXECUTION_CHAIN (0.60) now fires p_sem.
+    // θ_sem 0.6 with EXECUTION_CHAIN in H_sem: the 0.60 atom fires p_sem.
     let base = care("", "echo hi | sh");
     assert_eq!(base.event()["final"], "ask");
-    let r = care("[care.resolution]\ntheta_sem = 0.6\n", "echo hi | sh");
+    let r = care(
+        "[care.resolution]\ntheta_sem = 0.6\nh_sem = [\"EXECUTION_CHAIN\"]\n",
+        "echo hi | sh",
+    );
     assert_eq!(r.event()["skip_predicate"], "p_sem:EXECUTION_CHAIN");
     assert_eq!(r.event()["final"], "deny");
-    // H_sem without DESTRUCTIVE: rm -rf node_modules is no longer skipped.
+    // H_sem is empty by default (D27): rm -rf node_modules goes to the judge;
+    // adding DESTRUCTIVE (the paper's set has it) skips it to a deny.
     let base = care("", "rm -rf node_modules");
-    assert_eq!(base.event()["skip_predicate"], "p_sem:DESTRUCTIVE");
-    assert_eq!(base.event()["final"], "deny");
+    assert_eq!(base.event()["skip_predicate"], Value::Null);
+    assert_eq!(base.event()["would_adjudicate"], true);
+    assert_eq!(base.event()["final"], "ask");
     let r = care(
-        "[care.resolution]\nh_sem = [\"EXECUTION_CHAIN\", \"PERSISTENCE\"]\n",
+        "[care.resolution]\nh_sem = [\"DESTRUCTIVE\"]\n",
         "rm -rf node_modules",
     );
-    assert_eq!(r.event()["skip_predicate"], Value::Null);
-    assert_eq!(r.event()["would_adjudicate"], true);
-    assert_eq!(r.event()["final"], "ask");
+    assert_eq!(r.event()["skip_predicate"], "p_sem:DESTRUCTIVE");
+    assert_eq!(r.event()["final"], "deny");
 }
 
 #[test]
-fn weights_raising_w_sem_turns_allow_into_warn() {
+fn weights_lowering_w_sem_turns_warn_into_allow() {
     let base = care("", "npx foo");
-    assert_eq!(base.event()["final"], "allow");
-    let r = care("[care.weights]\nsem = 0.5\n", "npx foo");
+    assert_eq!(base.event()["aggregate"], 0.105);
+    assert_eq!(base.event()["final"], "ask");
+    let r = care("[care.weights]\nsem = 0.1\n", "npx foo");
     let ev = r.event();
-    assert_eq!(ev["aggregate"], 0.175);
-    assert_eq!(ev["provisional"]["balanced"], "WARN");
-    assert_eq!(ev["final"], "ask");
+    assert_eq!(ev["aggregate"], 0.035);
+    assert_eq!(ev["provisional"]["balanced"], "ALLOW");
+    assert_eq!(ev["final"], "allow");
 }
 
 #[test]
-fn class_base_raising_unknown_turns_allow_into_warn() {
-    let r = care("[care.class_base]\nUNKNOWN = 0.6\n", "npx foo");
+fn class_base_lowering_unknown_turns_warn_into_allow() {
+    let r = care("[care.class_base]\nUNKNOWN = 0.1\n", "npx foo");
     let ev = r.event();
-    assert_eq!(ev["scores"]["sem"], 0.6);
-    assert_eq!(ev["aggregate"], 0.18);
-    assert_eq!(ev["final"], "ask");
+    assert_eq!(ev["scores"]["sem"], 0.1);
+    assert_eq!(ev["aggregate"], 0.03);
+    assert_eq!(ev["final"], "allow");
 }
 
 #[test]
@@ -421,14 +427,15 @@ fn structure_raising_the_pipe_penalty_changes_the_strict_verdict() {
 }
 
 #[test]
-fn path_raising_traversal_read_turns_allow_into_warn() {
+fn path_lowering_traversal_read_turns_warn_into_allow() {
     let base = care("", "cat ../../x");
-    assert_eq!(base.event()["final"], "allow");
-    let r = care("[care.path]\ntraversal_read = 0.6\n", "cat ../../x");
+    assert_eq!(base.event()["scores"]["path"], 0.3);
+    assert_eq!(base.event()["final"], "ask");
+    let r = care("[care.path]\ntraversal_read = 0.1\n", "cat ../../x");
     let ev = r.event();
-    assert_eq!(ev["scores"]["path"], 0.6);
-    assert_eq!(ev["provisional"]["balanced"], "WARN");
-    assert_eq!(ev["final"], "ask");
+    assert_eq!(ev["scores"]["path"], 0.1);
+    assert_eq!(ev["provisional"]["balanced"], "ALLOW");
+    assert_eq!(ev["final"], "allow");
 }
 
 // ------------------------------------------------------------- Jev --

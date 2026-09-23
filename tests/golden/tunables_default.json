@@ -1,5 +1,5 @@
 {
-  "config_fingerprint": "1ae8acec3c61b1b4",
+  "config_fingerprint": "371a6d0ee7fe7bda",
   "tunables": {
     "care.class_base.DESTRUCTIVE": 1.0,
     "care.class_base.EXECUTION_CHAIN": 0.6,
@@ -13,8 +13,8 @@
     "care.class_base.WRITE_SENSITIVE": 0.7,
     "care.modes.auto.tau_high": 0.5,
     "care.modes.auto.tau_low": 0.2,
-    "care.modes.balanced.tau_high": 0.35,
-    "care.modes.balanced.tau_low": 0.15,
+    "care.modes.balanced.tau_high": 0.55,
+    "care.modes.balanced.tau_low": 0.04,
     "care.modes.strict.tau_high": 0.2,
     "care.modes.strict.tau_low": 0.1,
     "care.path.critical": 1.0,
@@ -28,15 +28,10 @@
     "care.provenance.gtfobins": 0.85,
     "care.provenance.manual": 0.6,
     "care.provenance.mitre": 1.0,
-    "care.resolution.h_sem": [
-      "NETWORK_FETCH",
-      "EXECUTION_CHAIN",
-      "PRIVILEGE_OR_PERMISSION",
-      "PERSISTENCE",
-      "DESTRUCTIVE"
-    ],
+    "care.resolution.h_sem": [],
     "care.resolution.theta_rule": 0.8,
     "care.resolution.theta_sem": 0.7,
+    "care.rules.\"SE-P-003\".confidence": 0.75,
     "care.structure.command_substitution": 0.3,
     "care.structure.eval": 0.9,
     "care.structure.nested_substitution": 0.6,

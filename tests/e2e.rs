@@ -427,7 +427,11 @@ fn analyze_emits_json() {
         .unwrap();
     assert!(out.status.success());
     let v: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(v["aggregate"], 0.765);
+    // D27: SE-P-003 at confidence 0.75 (paper 0.95) no longer fires p_rule;
+    // the path predicate still does, and the aggregate is >= τ_high.
+    assert_eq!(v["aggregate"], 0.705);
+    assert_eq!(v["skip_predicate"], "p_spath");
+    assert_eq!(v["provisional"]["balanced"], "DENY");
     assert_eq!(v["final"], "deny");
 }
 
