@@ -134,3 +134,10 @@ Constraints: no commit; tte read-only; never touch ~/.config/cancelli, ~/.claude
 - Default fingerprint 1ae8acec3c61b1b4 -> 371a6d0ee7fe7bda (golden regenerated deliberately).
 - Tuning evidence (offline `cancelli eval` harness, TUNE = procreations train+dev shell + ShellRisk dev, TEST scored once): see DESIGN D27.
 - FINAL: 171 offline tests pass (lib 96, docs 2, e2e 19, eval_e2e 5, jev_e2e 17, jev_offline 4, local_backend 8, parity 1, tunables_golden 2, tuning_e2e 17); clippy --all-targets and fmt clean.
+
+# D15 choice guard; D24 Jev fitting ruled out (2026-09-27)
+- decide::valid_choice: a choice answer needs finite, non-negative probabilities summing to 1 within CHOICE_SUM_TOLERANCE 0.05; otherwise check_complete fails -> D15 ask + error record. Before, a non-empty map passed, so a local backend's NaN (the llama.cpp hazard) or an unnormalised vector would have reached signals.
+- Tolerance from the logs: 6,834 logged Jev choice answers sum to 1 within 0.0100 (quantised to 0.01), at most 5 labels, none non-finite. jev_offline's cached Jev responses still pass.
+- Test decide::tests::choice_probabilities_must_be_a_distribution (NaN, inf, negative, sum 0.8, sum 1.06, empty; 0.99 and 1.04 pass). It fails with the old check.
+- Docs: D15 row, D24 row (fitting against Jev answers ruled out: MCA §2.3(b) and the user's no-Jev decision; `cancelli calibrate` to be refit on non-Jev labels later), research/local-jev-models.md notes.
+- FINAL: 172 offline tests pass (lib 97, docs 2, e2e 19, eval_e2e 5, jev_e2e 17, jev_offline 4, local_backend 8, parity 1, tunables_golden 2, tuning_e2e 17); clippy --all-targets and fmt clean.

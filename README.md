@@ -736,7 +736,9 @@ mode:
 Every failure produces **ask** plus an `error` record (`stage: "judge"`), and
 the hook still exits 0. Failures are: no key or a refused key file, a
 connection error, a timeout, a non-2xx response, an unparseable body, a
-missing or wrongly typed answer for any question sent,
+missing, wrongly typed or malformed answer for any question sent (a noul or
+score reading that is not finite; choice probabilities that are not finite,
+are negative, or do not sum to 1 within 0.05),
 `response.model != judge.expected_model` (default `"jev-1.13.0"`, D23), and
 a configured calibration file that is unreadable, invalid or pinned to
 another rubric or model (D24). Timing: `timeout_ms` (3,000) per request

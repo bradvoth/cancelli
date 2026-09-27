@@ -140,15 +140,31 @@ pub struct Usage {
     pub output_tokens: Option<u64>,
 }
 
+/// How far a choice answer's probabilities may sum from 1. Jev's are
+/// quantised to 0.01: its 6,834 logged choice answers (2026-09-27) stray by
+/// at most 0.01.
+pub const CHOICE_SUM_TOLERANCE: f64 = 0.05;
+
+/// Choice probabilities a verdict can rest on: at least one label, every
+/// value finite and non-negative, summing to 1 within
+/// [`CHOICE_SUM_TOLERANCE`]. A local backend can return NaN (the llama.cpp
+/// hazard) or an unnormalised vector; Jev's never do.
+pub fn valid_choice(p: &Ordered) -> bool {
+    !p.0.is_empty()
+        && p.0.iter().all(|(_, v)| v.is_finite() && *v >= 0.0)
+        && (p.0.iter().map(|(_, v)| v).sum::<f64>() - 1.0).abs() <= CHOICE_SUM_TOLERANCE
+}
+
 /// D15 "missing answers": every question sent must come back answered with
-/// its own primitive and a reading.
+/// its own primitive and a reading: a finite noul or score reading, or
+/// choice probabilities that pass [`valid_choice`].
 pub fn check_complete(rubric: &Rubric, caps: &[&str], answers: &Answers) -> Result<(), String> {
     let mut missing = Vec::new();
     for a in rubric.axes_at(caps) {
         let ok = answers.get(&a.id).is_some_and(|w| {
             w.kind == a.primitive.as_str()
                 && match a.primitive {
-                    Primitive::Choice => w.probabilities.as_ref().is_some_and(|p| !p.0.is_empty()),
+                    Primitive::Choice => w.probabilities.as_ref().is_some_and(valid_choice),
                     _ => w.reading().is_some_and(f64::is_finite),
                 }
         });
@@ -651,5 +667,68 @@ mod tests {
         let r = rubric().unwrap();
         let err = check_complete(r, &["actions"], &Answers::new()).unwrap_err();
         assert!(err.contains("39 question(s)"));
+    }
+
+    /// A well-formed answer to every question available at `caps`.
+    fn complete(r: &Rubric, caps: &[&str]) -> Answers {
+        r.axes_at(caps)
+            .map(|a| {
+                let mut w = WireAnswer {
+                    kind: a.primitive.as_str().to_string(),
+                    noul: None,
+                    score: None,
+                    legend: None,
+                    choice: None,
+                    probabilities: None,
+                };
+                match a.primitive {
+                    Primitive::Noul => w.noul = Some(0.5),
+                    Primitive::Score => w.score = Some(1.0),
+                    Primitive::Choice => {
+                        w.choice = Some("x".into());
+                        w.probabilities = Some(Ordered(vec![("x".into(), 0.7), ("y".into(), 0.3)]));
+                    }
+                }
+                (a.id.clone(), w)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn choice_probabilities_must_be_a_distribution() {
+        let r = rubric().unwrap();
+        let caps = ["actions"];
+        let good = complete(r, &caps);
+        assert!(check_complete(r, &caps, &good).is_ok());
+        let choice = r
+            .axes_at(&caps)
+            .find(|a| a.primitive == Primitive::Choice)
+            .unwrap()
+            .id
+            .clone();
+        let with = |p: &[f64]| {
+            let mut a = good.clone();
+            let labels = p.iter().enumerate().map(|(i, v)| (format!("l{i}"), *v));
+            a.get_mut(&choice).unwrap().probabilities = Some(Ordered(labels.collect()));
+            check_complete(r, &caps, &a)
+        };
+        // Jev's quantised sums pass, and so does the tolerance's edge
+        assert!(with(&[0.33, 0.33, 0.33]).is_ok());
+        assert!(with(&[0.52, 0.52]).is_ok());
+        let bad: [&[f64]; 6] = [
+            &[f64::NAN, 0.5],
+            &[f64::INFINITY, 0.0],
+            &[-0.2, 1.2],
+            &[0.5, 0.3],
+            &[0.53, 0.53],
+            &[],
+        ];
+        for p in bad {
+            let err = with(p).unwrap_err();
+            assert!(
+                err.contains("for 1 question(s)") && err.contains(&choice),
+                "{p:?}: {err}"
+            );
+        }
     }
 }
