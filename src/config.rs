@@ -5,13 +5,18 @@
 //! Precedence: CLI flag > env var > config file > built-in default. A missing
 //! file means defaults; an unreadable/invalid file means defaults plus an
 //! error diagnostic; unknown keys produce warning diagnostics.
+//!
+//! `judge.provider` (D28) has no environment form: it is the file's value or
+//! the default, and it decides which variable (`TYPESAFE_BASE_URL` or
+//! `OPENROUTER_BASE_URL`) is the env override of `judge.base_url`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
-use crate::jev::client::{self, DEFAULT_EXPECTED_MODEL, KeySource, Secret};
+use crate::jev::client::{self, KeySource, Secret};
+use crate::jev::provider::{self, Provider};
 use crate::policy::Mode;
 use crate::tunables::{self, Tunables};
 
@@ -37,9 +42,9 @@ pub struct Env {
     pub log_dir: Option<String>,
     /// `$CANCELLI_MODE`.
     pub mode: Option<String>,
-    /// `$TYPESAFE_BASE_URL`.
-    pub base_url: Option<String>,
-    /// Every variable (the key env var is named by `judge.api_key_env`).
+    /// Every variable: the key (named by `judge.api_key_env`) and the
+    /// provider's base-URL override (`TYPESAFE_BASE_URL` /
+    /// `OPENROUTER_BASE_URL`, D28) are read from it.
     pub vars: EnvVars,
 }
 
@@ -52,7 +57,6 @@ impl Env {
             xdg_config_home: get("XDG_CONFIG_HOME"),
             log_dir: get("CANCELLI_LOG_DIR"),
             mode: get("CANCELLI_MODE"),
-            base_url: get("TYPESAFE_BASE_URL"),
             // `vars_os`: `std::env::vars()` panics on a non-UTF-8 variable,
             // and this runs before the hook's panic guard.
             vars: EnvVars(
@@ -113,8 +117,13 @@ pub struct Config {
     pub decide_all: bool,
     /// Judge backend: `jev` | `stub`.
     pub judge_backend: String,
+    /// D28: who serves the judge (`typesafe` | `openrouter`); supplies the
+    /// defaults of the five keys below it.
+    pub judge_provider: Provider,
     /// Jev base URL.
     pub judge_base_url: String,
+    /// D28: endpoint path appended to the base URL.
+    pub judge_path: String,
     /// Requested model (responses must report `judge.expected_model`,
     /// a tunable: `tunables.judge.expected_model`).
     pub judge_model: String,
@@ -181,6 +190,7 @@ impl Loaded {
         tunables::Loaded {
             tunables: self.config.tunables.clone(),
             from_file: self.tunables_from_file.clone(),
+            overrides: self.overrides.clone(),
         }
     }
 }
@@ -213,10 +223,13 @@ max_field_bytes = 4096            # non-Bash string truncation threshold
 
 [judge]
 backend = "jev"            # "jev" | "stub"
-base_url = "https://api.typesafe.ai"   # env TYPESAFE_BASE_URL overrides
-model = "jev-1.13.0"       # requested model (sent in the request body)
-# expected_model = "jev-1.13.0"   # D23: response.model must equal this, else ask (D15); set it for another /v1/systemone server
-api_key_env = "TYPESAFE_API_KEY"
+# provider = "typesafe"    # D28: "typesafe" (api.typesafe.ai, the default) | "openrouter" (OpenRouter's Decisions API, the same Jev model).
+#                          # It sets the defaults of base_url, path, model, expected_model and api_key_env; a key set here still wins.
+# base_url = "https://api.typesafe.ai"   # provider default (openrouter: https://openrouter.ai); env TYPESAFE_BASE_URL / OPENROUTER_BASE_URL overrides
+# path = "/v1/systemone"                 # provider default (openrouter: /api/alpha/decisions)
+# model = "jev-1.13.0"                   # requested model, sent in the request body; provider default (openrouter: typesafe/jev-1.13)
+# expected_model = "jev-1.13.0"   # D23: response.model must match this, else ask (D15); exact, or a prefix with one trailing * (D28); provider default (openrouter: typesafe/jev-1.13-*); set it for another /v1/systemone server
+# api_key_env = "TYPESAFE_API_KEY"       # provider default (openrouter: OPENROUTER_API_KEY)
 # api_key_file = "~/.config/cancelli/jev_api_key"   # 0600; used if the env var is unset (this path is the default when the file exists)
 api_key_required = true    # D23: false for local servers: no key needed, no Authorization header when none is found
 timeout_ms = 3000          # per request
@@ -230,8 +243,8 @@ pub fn default_file() -> String {
     format!("{DEFAULT_FILE}{}", tunables::init_template())
 }
 
-/// Default Jev base URL.
-pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
+/// Default Jev base URL (the TypeSafe provider's).
+pub const DEFAULT_BASE_URL: &str = provider::TYPESAFE.base_url;
 
 /// Config file location per D10.
 pub fn config_path(env: &Env) -> Option<PathBuf> {
@@ -281,7 +294,9 @@ const KNOWN: &[(&str, &[&str])] = &[
         "judge",
         &[
             "backend",
+            "provider",
             "base_url",
+            "path",
             "model",
             "api_key_env",
             "api_key_file",
@@ -310,10 +325,7 @@ pub fn load_from(path: Option<PathBuf>, env: &Env, cli: &CliOverrides) -> Loaded
     let mut max_field_bytes: usize = 4096;
     let mut decide_all = true;
     let mut backend = "jev".to_string();
-    let mut base_url = DEFAULT_BASE_URL.to_string();
-    let mut model = DEFAULT_EXPECTED_MODEL.to_string();
     let mut api_key_required = true;
-    let mut api_key_env = "TYPESAFE_API_KEY".to_string();
     let mut api_key_file: Option<String> = None;
     let mut timeout_ms: u64 = 3000;
     let mut budget_ms: u64 = 5000;
@@ -324,7 +336,9 @@ pub fn load_from(path: Option<PathBuf>, env: &Env, cli: &CliOverrides) -> Loaded
         "log.dir",
         "log.max_field_bytes",
         "judge.backend",
+        "judge.provider",
         "judge.base_url",
+        "judge.path",
         "judge.model",
         "judge.api_key_env",
         "judge.api_key_file",
@@ -335,92 +349,78 @@ pub fn load_from(path: Option<PathBuf>, env: &Env, cli: &CliOverrides) -> Loaded
         sources.insert(k, Source::Default);
     }
 
-    let mut file_found = false;
-    let mut root: Option<toml::Table> = None;
-    if let Some(p) = &path {
-        match std::fs::read_to_string(p) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => diags.push(Diagnostic {
-                level: "error",
-                message: format!("cannot read {}: {e}; using defaults", p.display()),
-            }),
-            Ok(text) => {
-                file_found = true;
-                match text.parse::<toml::Table>() {
-                    Err(e) => diags.push(Diagnostic {
-                        level: "error",
-                        message: format!("invalid TOML in {}: {e}; using defaults", p.display()),
-                    }),
-                    Ok(table) => {
-                        root = Some(table.clone());
-                        let mut f = FileValues::default();
-                        match f.read(&table, &mut diags) {
-                            Ok(()) => {
-                                if let Some(v) = f.mode {
-                                    mode = v;
-                                    sources.insert("mode", Source::File);
-                                }
-                                if let Some(v) = f.dry_run {
-                                    dry_run = v;
-                                    sources.insert("dry_run", Source::File);
-                                }
-                                if let Some(v) = f.log_dir {
-                                    log_dir = v;
-                                    sources.insert("log.dir", Source::File);
-                                }
-                                if let Some(v) = f.max_field_bytes {
-                                    max_field_bytes = v;
-                                    sources.insert("log.max_field_bytes", Source::File);
-                                }
-                                if let Some(v) = f.decide_all {
-                                    decide_all = v;
-                                    sources.insert("decide_all", Source::File);
-                                }
-                                if let Some(v) = f.backend {
-                                    backend = v;
-                                    sources.insert("judge.backend", Source::File);
-                                }
-                                if let Some(v) = f.base_url {
-                                    base_url = v;
-                                    sources.insert("judge.base_url", Source::File);
-                                }
-                                if let Some(v) = f.model {
-                                    model = v;
-                                    sources.insert("judge.model", Source::File);
-                                }
-                                if let Some(v) = f.api_key_env {
-                                    api_key_env = v;
-                                    sources.insert("judge.api_key_env", Source::File);
-                                }
-                                if let Some(v) = f.api_key_file {
-                                    api_key_file = Some(v);
-                                    sources.insert("judge.api_key_file", Source::File);
-                                }
-                                if let Some(v) = f.api_key_required {
-                                    api_key_required = v;
-                                    sources.insert("judge.api_key_required", Source::File);
-                                }
-                                if let Some(v) = f.timeout_ms {
-                                    timeout_ms = v;
-                                    sources.insert("judge.timeout_ms", Source::File);
-                                }
-                                if let Some(v) = f.budget_ms {
-                                    budget_ms = v;
-                                    sources.insert("judge.budget_ms", Source::File);
-                                }
-                            }
-                            Err(msg) => diags.push(Diagnostic {
-                                level: "error",
-                                message: format!(
-                                    "invalid config {}: {msg}; using defaults",
-                                    p.display()
-                                ),
-                            }),
-                        }
-                    }
-                }
-            }
-        }
+    let (file_found, root, f) = match &path {
+        Some(p) => read_file(p, &mut diags),
+        None => (false, None, FileValues::default()),
+    };
+    if let Some(v) = f.mode {
+        mode = v;
+        sources.insert("mode", Source::File);
+    }
+    if let Some(v) = f.dry_run {
+        dry_run = v;
+        sources.insert("dry_run", Source::File);
+    }
+    if let Some(v) = f.log_dir {
+        log_dir = v;
+        sources.insert("log.dir", Source::File);
+    }
+    if let Some(v) = f.max_field_bytes {
+        max_field_bytes = v;
+        sources.insert("log.max_field_bytes", Source::File);
+    }
+    if let Some(v) = f.decide_all {
+        decide_all = v;
+        sources.insert("decide_all", Source::File);
+    }
+    if let Some(v) = f.backend {
+        backend = v;
+        sources.insert("judge.backend", Source::File);
+    }
+    if let Some(v) = f.api_key_file {
+        api_key_file = Some(v);
+        sources.insert("judge.api_key_file", Source::File);
+    }
+    if let Some(v) = f.api_key_required {
+        api_key_required = v;
+        sources.insert("judge.api_key_required", Source::File);
+    }
+    if let Some(v) = f.timeout_ms {
+        timeout_ms = v;
+        sources.insert("judge.timeout_ms", Source::File);
+    }
+    if let Some(v) = f.budget_ms {
+        budget_ms = v;
+        sources.insert("judge.budget_ms", Source::File);
+    }
+
+    // D28: the provider (file, else the default), then its defaults, then
+    // the file's own values.
+    let mut judge_provider = Provider::default();
+    if let Some(p) = f.provider {
+        judge_provider = p;
+        sources.insert("judge.provider", Source::File);
+    }
+    let d = judge_provider.defaults();
+    let mut base_url = d.base_url.to_string();
+    let mut judge_path = d.path.to_string();
+    let mut model = d.model.to_string();
+    let mut api_key_env = d.api_key_env.to_string();
+    if let Some(v) = f.base_url {
+        base_url = v;
+        sources.insert("judge.base_url", Source::File);
+    }
+    if let Some(v) = f.path {
+        judge_path = v;
+        sources.insert("judge.path", Source::File);
+    }
+    if let Some(v) = f.model {
+        model = v;
+        sources.insert("judge.model", Source::File);
+    }
+    if let Some(v) = f.api_key_env {
+        api_key_env = v;
+        sources.insert("judge.api_key_env", Source::File);
     }
 
     if let Some(m) = &env.mode {
@@ -439,8 +439,8 @@ pub fn load_from(path: Option<PathBuf>, env: &Env, cli: &CliOverrides) -> Loaded
         log_dir = d.clone();
         sources.insert("log.dir", Source::Env);
     }
-    if let Some(u) = &env.base_url {
-        base_url = u.clone();
+    if let Some(u) = env.var(d.base_url_env) {
+        base_url = u.to_string();
         sources.insert("judge.base_url", Source::Env);
     }
     if let Some(m) = cli.mode {
@@ -466,9 +466,9 @@ pub fn load_from(path: Option<PathBuf>, env: &Env, cli: &CliOverrides) -> Loaded
 
     // Tunables are validated key by key (D20), independently of the keys
     // above: a bad `mode` does not reset them, nor they it.
-    let tl = tunables::load(root.as_ref(), env, &mut diags);
+    let tl = tunables::load(root.as_ref(), env, d.expected_model, &mut diags);
     let fingerprint = tl.tunables.fingerprint();
-    let overrides = tl.tunables.overrides();
+    let overrides = tl.overrides.clone();
 
     Loaded {
         config: Config {
@@ -478,7 +478,9 @@ pub fn load_from(path: Option<PathBuf>, env: &Env, cli: &CliOverrides) -> Loaded
             max_field_bytes,
             decide_all,
             judge_backend: backend,
+            judge_provider,
             judge_base_url: base_url,
+            judge_path,
             judge_model: model,
             judge_api_key_env: api_key_env,
             judge_api_key_file: api_key_file
@@ -499,6 +501,44 @@ pub fn load_from(path: Option<PathBuf>, env: &Env, cli: &CliOverrides) -> Loaded
     }
 }
 
+/// Read and parse the config file: (found, the TOML root when it parsed,
+/// the non-tunable values when they were all valid). Every failure is a
+/// diagnostic and leaves the defaults.
+fn read_file(p: &Path, diags: &mut Vec<Diagnostic>) -> (bool, Option<toml::Table>, FileValues) {
+    let text = match std::fs::read_to_string(p) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (false, None, FileValues::default());
+        }
+        Err(e) => {
+            diags.push(Diagnostic {
+                level: "error",
+                message: format!("cannot read {}: {e}; using defaults", p.display()),
+            });
+            return (false, None, FileValues::default());
+        }
+    };
+    let table = match text.parse::<toml::Table>() {
+        Ok(table) => table,
+        Err(e) => {
+            diags.push(Diagnostic {
+                level: "error",
+                message: format!("invalid TOML in {}: {e}; using defaults", p.display()),
+            });
+            return (true, None, FileValues::default());
+        }
+    };
+    let mut f = FileValues::default();
+    if let Err(msg) = f.read(&table, diags) {
+        diags.push(Diagnostic {
+            level: "error",
+            message: format!("invalid config {}: {msg}; using defaults", p.display()),
+        });
+        f = FileValues::default();
+    }
+    (true, Some(table), f)
+}
+
 #[derive(Default)]
 struct FileValues {
     mode: Option<Mode>,
@@ -507,7 +547,9 @@ struct FileValues {
     max_field_bytes: Option<usize>,
     decide_all: Option<bool>,
     backend: Option<String>,
+    provider: Option<Provider>,
     base_url: Option<String>,
+    path: Option<String>,
     model: Option<String>,
     api_key_env: Option<String>,
     api_key_file: Option<String>,
@@ -582,7 +624,20 @@ impl FileValues {
             {
                 return Err(format!("judge.backend {b:?} is not jev|stub"));
             }
+            if let Some(v) = j.get("provider") {
+                let s = v.as_str().ok_or("judge.provider must be a string")?;
+                self.provider =
+                    Some(Provider::parse(s).ok_or_else(|| {
+                        format!("judge.provider {s:?} is not {}", provider::names())
+                    })?);
+            }
             self.base_url = table_str(j, "judge", "base_url")?;
+            self.path = table_str(j, "judge", "path")?;
+            if let Some(p) = &self.path
+                && !p.starts_with('/')
+            {
+                return Err(format!("judge.path {p:?} must start with '/'"));
+            }
             self.model = table_str(j, "judge", "model")?;
             self.api_key_env = table_str(j, "judge", "api_key_env")?;
             self.api_key_file = table_str(j, "judge", "api_key_file")?;
@@ -679,9 +734,19 @@ pub fn render(l: &Loaded, env: &Env) -> String {
         src("judge.backend")
     ));
     out.push_str(&format!(
+        "judge.provider = {:?}  # {}\n",
+        c.judge_provider.as_str(),
+        src("judge.provider")
+    ));
+    out.push_str(&format!(
         "judge.base_url = {:?}  # {}\n",
         c.judge_base_url,
         src("judge.base_url")
+    ));
+    out.push_str(&format!(
+        "judge.path = {:?}  # {}\n",
+        c.judge_path,
+        src("judge.path")
     ));
     out.push_str(&format!(
         "judge.model = {:?}  # {}\n",
@@ -900,7 +965,9 @@ mod tests {
         assert_eq!(l.config.judge_base_url, "http://127.0.0.1:9");
         assert_eq!(l.config.judge_api_key_file, Some(d.path().join("home/k")));
         assert_eq!(l.config.judge_budget_ms, 250);
-        env.base_url = Some("http://env.example".into());
+        env.vars
+            .0
+            .insert("TYPESAFE_BASE_URL".into(), "http://env.example".into());
         let l = load(&env, &CliOverrides::default());
         assert_eq!(
             (
@@ -941,5 +1008,148 @@ mod tests {
         assert!(out.contains("judge.budget_ms = 5000  # default"));
         assert!(!out.contains("tsk_supersecret_123"));
         assert!(!format!("{env:?}").contains("tsk_supersecret_123"));
+    }
+
+    fn write_config(env: &Env, text: &str) -> PathBuf {
+        let p = config_path(env).unwrap();
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(&p, text).unwrap();
+        p
+    }
+
+    fn set(env: &mut Env, k: &str, v: &str) {
+        env.vars.0.insert(k.into(), v.into());
+    }
+
+    #[test]
+    fn d28_provider_from_file_sets_the_transport_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        let mut env = env_in(d.path());
+        write_config(&env, "[judge]\nprovider = \"openrouter\"\n");
+        let l = load(&env, &CliOverrides::default());
+        assert!(l.diagnostics.is_empty(), "{:?}", l.diagnostics);
+        let c = &l.config;
+        assert_eq!(c.judge_provider, Provider::OpenRouter);
+        assert_eq!(c.judge_base_url, "https://openrouter.ai");
+        assert_eq!(c.judge_path, "/api/alpha/decisions");
+        assert_eq!(c.judge_model, "typesafe/jev-1.13");
+        assert_eq!(c.judge_api_key_env, "OPENROUTER_API_KEY");
+        assert_eq!(c.tunables.judge.expected_model, "typesafe/jev-1.13-*");
+        assert_eq!(l.sources["judge.provider"], Source::File);
+        // the provider's expected_model is a default, not an override
+        assert!(l.overrides.is_empty(), "{:?}", l.overrides);
+        for k in [
+            "judge.base_url",
+            "judge.path",
+            "judge.model",
+            "judge.api_key_env",
+        ] {
+            assert_eq!(l.sources[k], Source::Default, "{k}");
+        }
+        let out = render(&l, &env);
+        assert!(
+            out.contains("judge.provider = \"openrouter\"  # file\n"),
+            "{out}"
+        );
+        assert!(out.contains("judge.path = \"/api/alpha/decisions\"  # default\n"));
+        assert!(out.contains("# judge api key: no Jev API key: $OPENROUTER_API_KEY is unset"));
+
+        // the provider's base-URL variable overrides; TypeSafe's does not
+        set(&mut env, "TYPESAFE_BASE_URL", "http://ts.example");
+        let l = load(&env, &CliOverrides::default());
+        assert_eq!(l.config.judge_base_url, "https://openrouter.ai");
+        set(&mut env, "OPENROUTER_BASE_URL", "http://or.example");
+        let l = load(&env, &CliOverrides::default());
+        assert_eq!(l.config.judge_base_url, "http://or.example");
+        assert_eq!(l.sources["judge.base_url"], Source::Env);
+
+        // explicit keys still win over the provider's defaults
+        write_config(
+            &env,
+            "[judge]\nprovider = \"openrouter\"\nmodel = \"m\"\npath = \"/p\"\n\
+             api_key_env = \"K\"\nexpected_model = \"e\"\n",
+        );
+        let l = load(&env, &CliOverrides::default());
+        let c = &l.config;
+        assert_eq!(
+            (
+                c.judge_model.as_str(),
+                c.judge_path.as_str(),
+                c.judge_api_key_env.as_str()
+            ),
+            ("m", "/p", "K")
+        );
+        assert_eq!(c.tunables.judge.expected_model, "e");
+        assert_eq!(l.sources["judge.path"], Source::File);
+    }
+
+    #[test]
+    fn d28_an_exported_key_never_selects_the_provider() {
+        let d = tempfile::tempdir().unwrap();
+        let mut env = env_in(d.path());
+        set(&mut env, "OPENROUTER_API_KEY", "or_key_123456");
+        set(&mut env, "OPENROUTER_BASE_URL", "http://or.example");
+        // no file, an empty file, and the recommended key-file-only setup
+        for config in [None, Some(""), Some("[judge]\napi_key_file = \"~/k\"\n")] {
+            if let Some(c) = config {
+                write_config(&env, c);
+            }
+            let l = load(&env, &CliOverrides::default());
+            assert_eq!(l.config.judge_provider, Provider::TypeSafe, "{config:?}");
+            assert_eq!(l.sources["judge.provider"], Source::Default);
+            assert_eq!(l.config.judge_base_url, DEFAULT_BASE_URL);
+            assert_eq!(l.config.judge_path, "/v1/systemone");
+            assert_eq!(l.config.judge_api_key_env, "TYPESAFE_API_KEY");
+            assert!(l.diagnostics.is_empty(), "{:?}", l.diagnostics);
+            assert!(l.config.api_key(&env).is_err(), "TypeSafe's key is wanted");
+        }
+        let out = render(&load(&env, &CliOverrides::default()), &env);
+        assert!(
+            out.contains("judge.provider = \"typesafe\"  # default\n"),
+            "{out}"
+        );
+        assert!(!out.contains("or_key_123456"));
+    }
+
+    #[test]
+    fn d28_bad_provider_or_path_is_an_error_and_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        let env = env_in(d.path());
+        write_config(&env, "[judge]\nprovider = \"gpt\"\n");
+        let l = load(&env, &CliOverrides::default());
+        assert_eq!(l.diagnostics[0].level, "error");
+        assert!(
+            l.diagnostics[0]
+                .message
+                .contains("judge.provider \"gpt\" is not typesafe|openrouter"),
+            "{}",
+            l.diagnostics[0].message
+        );
+        assert_eq!(l.config.judge_provider, Provider::TypeSafe);
+        write_config(&env, "[judge]\npath = \"v1/systemone\"\n");
+        let l = load(&env, &CliOverrides::default());
+        assert!(
+            l.diagnostics[0]
+                .message
+                .contains("judge.path \"v1/systemone\" must start with '/'")
+        );
+        assert_eq!(l.config.judge_path, "/v1/systemone");
+        // a wildcard anywhere but the end is refused; the provider default stands
+        write_config(
+            &env,
+            "[judge]\nprovider = \"openrouter\"\nexpected_model = \"typesafe/*-1.13\"\n",
+        );
+        let l = load(&env, &CliOverrides::default());
+        assert!(
+            l.diagnostics
+                .iter()
+                .any(|d| d.level == "error" && d.message.contains("judge.expected_model")),
+            "{:?}",
+            l.diagnostics
+        );
+        assert_eq!(
+            l.config.tunables.judge.expected_model,
+            "typesafe/jev-1.13-*"
+        );
     }
 }

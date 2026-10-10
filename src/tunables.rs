@@ -30,6 +30,7 @@ use crate::jev::A6;
 use crate::jev::calibration::{self, Calibration};
 use crate::jev::client::DEFAULT_EXPECTED_MODEL;
 use crate::jev::decide::{TIERS, TierId, Verdict as JevVerdict, unavailable_tiers};
+use crate::jev::provider;
 use crate::jev::rubric::{self, EXPECTED_RUBRIC_HASH, Rubric};
 use crate::jev::state::{Level, MAX_FIELD_CHARS, MAX_PRIOR_CHARS};
 use crate::policy::{self, Mode};
@@ -846,7 +847,7 @@ pub const KNOBS: &[Knob] = &[
     },
     Knob {
         key: "judge.expected_model",
-        doc: "response.model the /v1/systemone backend must report; anything else asks (D15)",
+        doc: "response.model the backend must report, exactly or as a non-empty prefix ending in * (default: the provider's Jev name, D28); anything else asks (D15)",
         source: "D23",
     },
     Knob {
@@ -991,10 +992,25 @@ impl Tunables {
         d.iter().take(8).map(|x| format!("{x:02x}")).collect()
     }
 
-    /// `overrides[]`: dotted keys whose effective value differs from the
-    /// default, sorted.
+    /// The defaults under a provider (D28): [`Tunables::default`] with
+    /// `judge.expected_model` set to the provider's.
+    pub fn defaults_for(expected_model: &str) -> Tunables {
+        let mut t = Tunables::default();
+        t.judge.expected_model = expected_model.to_string();
+        t
+    }
+
+    /// `overrides[]` against [`Tunables::default`] (the TypeSafe provider).
     pub fn overrides(&self) -> Vec<String> {
-        let def = Tunables::default().canonical();
+        self.overrides_from(&Tunables::default())
+    }
+
+    /// `overrides[]`: dotted keys whose effective value differs from
+    /// `baseline`, sorted. The hook and `cancelli config` use the
+    /// provider's defaults as the baseline (D28), so a provider's own
+    /// `expected_model` is never reported as an override.
+    pub fn overrides_from(&self, baseline: &Tunables) -> Vec<String> {
+        let def = baseline.canonical();
         let cur = self.canonical();
         let keys: BTreeSet<&String> = def.keys().chain(cur.keys()).collect();
         keys.into_iter()
@@ -1028,6 +1044,8 @@ pub struct Loaded {
     pub tunables: Tunables,
     /// Dotted keys whose value came (validly) from the file.
     pub from_file: BTreeSet<String>,
+    /// `overrides[]`: keys that differ from the provider's defaults (D28).
+    pub overrides: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -1528,9 +1546,9 @@ fn load_jev(t: &Table, rd: &mut Rd<'_>, env: &Env) -> JevTunables {
                             path.display(),
                             r.hash
                         ));
-                        if r.model != DEFAULT_EXPECTED_MODEL {
+                        if !provider::is_jev(&r.model) {
                             rd.warn(format!(
-                                "{key}: rubric model {:?} is not {DEFAULT_EXPECTED_MODEL:?}",
+                                "{key}: rubric model {:?} is not Jev's ({DEFAULT_EXPECTED_MODEL:?})",
                                 r.model
                             ));
                         }
@@ -1576,19 +1594,38 @@ pub fn rubric_warnings(j: &JevTunables) -> Vec<String> {
 
 /// `[judge]` expected_model and calibration_file (the other `[judge]` keys
 /// are transport settings read by `config`, which also reports unknown
-/// keys). The calibration is validated against the rubric in use.
-fn load_judge(t: &Table, rd: &mut Rd<'_>, env: &Env, jev: &JevTunables) -> JudgeTunables {
-    let mut j = JudgeTunables::default();
+/// keys). `expected_model` defaults to the provider's (D28), which is Jev
+/// under both providers. The calibration is validated against the rubric
+/// in use.
+fn load_judge(
+    t: &Table,
+    rd: &mut Rd<'_>,
+    env: &Env,
+    jev: &JevTunables,
+    expected_model_default: &str,
+) -> JudgeTunables {
+    let mut j = JudgeTunables {
+        expected_model: expected_model_default.to_string(),
+        ..JudgeTunables::default()
+    };
     if let Some(v) = t.get("expected_model") {
         let key = "judge.expected_model";
-        match v.as_str().filter(|s| !s.is_empty() && s.trim() == *s) {
+        // A `*` only as the last character, after a non-empty prefix: a
+        // bare `*` would accept every model and void the D15 check.
+        let well_formed = |s: &&str| {
+            !s.is_empty() && s.trim() == *s && s.find('*').is_none_or(|i| i > 0 && i == s.len() - 1)
+        };
+        match v.as_str().filter(well_formed) {
             Some(s) => {
                 j.expected_model = s.to_string();
                 rd.set.insert(key.into());
             }
             None => rd.error(
                 key,
-                format!("{v} is not a non-empty model name without surrounding spaces"),
+                format!(
+                    "{v} is not a non-empty model name without surrounding spaces \
+                     (a single trailing * after a non-empty prefix is the only wildcard)"
+                ),
             ),
         }
     }
@@ -1602,7 +1639,7 @@ fn load_judge(t: &Table, rd: &mut Rd<'_>, env: &Env, jev: &JevTunables) -> Judge
                 let loaded = effective_rubric(jev)
                     .and_then(|r| calibration::load(&path, &r))
                     .and_then(|c| {
-                        if c.file.model == j.expected_model {
+                        if crate::jev::model_matches(&j.expected_model, &c.file.model) {
                             Ok(c)
                         } else {
                             Err(format!(
@@ -1627,7 +1664,7 @@ fn load_judge(t: &Table, rd: &mut Rd<'_>, env: &Env, jev: &JevTunables) -> Judge
             }
         }
     }
-    if j.expected_model != DEFAULT_EXPECTED_MODEL && j.calibration == CalibrationState::None {
+    if !provider::is_jev(&j.expected_model) && j.calibration == CalibrationState::None {
         rd.warn(format!(
             "judge.expected_model {:?}: the jev tier thresholds were calibrated on \
              {DEFAULT_EXPECTED_MODEL:?}; consider judge.calibration_file (D24)",
@@ -1647,12 +1684,18 @@ fn effective_rubric(j: &JevTunables) -> Result<Rubric, String> {
 /// Read the `care`, `jev` and (decision-relevant) `judge` tables of a
 /// parsed config file (None: no file, or not valid TOML). Every value is
 /// validated on its own.
-pub fn load(root: Option<&Table>, env: &Env, diags: &mut Vec<Diagnostic>) -> Loaded {
+pub fn load(
+    root: Option<&Table>,
+    env: &Env,
+    expected_model_default: &str,
+    diags: &mut Vec<Diagnostic>,
+) -> Loaded {
     let mut rd = Rd {
         diags,
         set: BTreeSet::new(),
     };
-    let mut t = Tunables::default();
+    let baseline = Tunables::defaults_for(expected_model_default);
+    let mut t = baseline.clone();
     if let Some(root) = root {
         if let Some(c) = rd.table(root, "", "care") {
             t.care = load_care(c, &mut rd);
@@ -1662,13 +1705,14 @@ pub fn load(root: Option<&Table>, env: &Env, diags: &mut Vec<Diagnostic>) -> Loa
         }
         // `[judge]` not being a table is reported by `config`.
         if let Some(TV::Table(j)) = root.get("judge") {
-            t.judge = load_judge(j, &mut rd, env, &t.jev);
+            t.judge = load_judge(j, &mut rd, env, &t.jev, expected_model_default);
         }
     }
     for w in rubric_warnings(&t.jev) {
         rd.warn(w);
     }
     Loaded {
+        overrides: t.overrides_from(&baseline),
         tunables: t,
         from_file: rd.set,
     }
@@ -1694,7 +1738,7 @@ pub fn render(l: &Loaded) -> String {
     let mut out = format!(
         "# tunables (D18-D20): config_fingerprint = {}; overrides = {:?}\n",
         t.fingerprint(),
-        t.overrides()
+        l.overrides
     );
     for (k, v) in t.entries() {
         if k.starts_with("care.rules.") {
@@ -1815,8 +1859,37 @@ mod tests {
     fn load_str(s: &str) -> (Loaded, Vec<Diagnostic>) {
         let t: Table = s.parse().unwrap();
         let mut d = Vec::new();
-        let l = load(Some(&t), &Env::default(), &mut d);
+        let l = load(Some(&t), &Env::default(), DEFAULT_EXPECTED_MODEL, &mut d);
         (l, d)
+    }
+
+    #[test]
+    fn expected_model_wildcard_needs_a_non_empty_prefix() {
+        for bad in ["\"*\"", "\"*jev\"", "\"jev*1\"", "\"\"", "\" jev-1.13.0\""] {
+            let (l, d) = load_str(&format!("[judge]\nexpected_model = {bad}\n"));
+            assert_eq!(
+                l.tunables.judge.expected_model, DEFAULT_EXPECTED_MODEL,
+                "{bad}"
+            );
+            assert!(
+                d.iter()
+                    .any(|x| x.level == "error" && x.message.contains("judge.expected_model")),
+                "{bad}: {d:?}"
+            );
+        }
+        let (l, d) = load_str("[judge]\nexpected_model = \"typesafe/jev-1.13-*\"\n");
+        assert_eq!(l.tunables.judge.expected_model, "typesafe/jev-1.13-*");
+        assert!(d.is_empty(), "still Jev: no calibration warning; {d:?}");
+        assert_eq!(l.overrides, vec!["judge.expected_model".to_string()]);
+        // the same value is a default, not an override, under its provider
+        let l = load(
+            None,
+            &Env::default(),
+            "typesafe/jev-1.13-*",
+            &mut Vec::new(),
+        );
+        assert_eq!(l.tunables.judge.expected_model, "typesafe/jev-1.13-*");
+        assert!(l.overrides.is_empty(), "{:?}", l.overrides);
     }
 
     #[test]

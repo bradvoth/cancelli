@@ -10,7 +10,8 @@
 //! * **CARE** is replayed exactly from the logged `command`.
 //! * **Jev**: when the would-be state and the rubric are unchanged and the
 //!   effective backend (`base_url` host + `expected_model`) is the one the
-//!   record was judged with, the logged answers are reused and evaluated
+//!   record was judged with, or both are Jev under either provider (D28),
+//!   the logged answers are reused and evaluated
 //!   under the new config (calibration, thresholds, tier order, verdicts).
 //!   Otherwise the configured backend is queried: the logged state is
 //!   resent if the record has one; a call that newly reaches the judge gets
@@ -41,6 +42,7 @@ use serde_json::{Map, Value, json};
 use crate::config::{self, CliOverrides, Config, Env, Loaded};
 use crate::hook;
 use crate::jev::client::{self, DEFAULT_EXPECTED_MODEL, KeySource, Secret};
+use crate::jev::provider;
 use crate::jev::state::Level;
 use crate::jev::transcript::{Context, ContextSource};
 use crate::jev::{self, JudgeRecord};
@@ -726,6 +728,14 @@ struct ReplayCtx<'a> {
     new_ctx_overridden: bool,
 }
 
+/// Was the record judged by the backend now configured? The same host and
+/// `expected_model`, or Jev on both sides: the two providers serve the
+/// same model (D28), so answers carry across them.
+fn same_backend(l: &Logged, rc: &ReplayCtx<'_>) -> bool {
+    (l.host == rc.host && l.expected_model == rc.expected)
+        || (l.model.as_deref().is_some_and(provider::is_jev) && provider::is_jev(rc.expected))
+}
+
 fn replay_one(
     r: &Value,
     tool: &str,
@@ -755,7 +765,7 @@ fn replay_one(
                 ))
             } else if l.rubric_hash != rc.rubric_hash {
                 Err(format!("rubric {}→{}", l.rubric_hash, rc.rubric_hash))
-            } else if l.host != rc.host || l.expected_model != rc.expected {
+            } else if !same_backend(l, rc) {
                 Err(format!(
                     "backend {}/{}→{}/{}",
                     l.host, l.expected_model, rc.host, rc.expected

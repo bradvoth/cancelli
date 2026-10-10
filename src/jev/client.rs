@@ -1,5 +1,7 @@
-//! Blocking HTTP transport for `POST {base_url}/v1/systemone` (ureq +
-//! rustls), the API key, and the retry/budget policy.
+//! Blocking HTTP transport for `POST {base_url}{path}` (ureq + rustls),
+//! the API key, and the retry/budget policy. The path is `/v1/systemone`
+//! for TypeSafe and `/api/alpha/decisions` for OpenRouter (D28,
+//! [`super::provider`]).
 //!
 //! * Per-attempt timeout `timeout_ms`, total budget `budget_ms`.
 //! * At most one retry, only on 408/429/5xx or a timeout, and only if the
@@ -31,7 +33,8 @@ pub fn host_of(base_url: &str) -> String {
     host.to_ascii_lowercase()
 }
 
-/// Response header carrying the request id.
+/// Response header carrying the request id (TypeSafe's; OpenRouter does
+/// not send it, so `request_id` is null there, D28).
 pub const REQUEST_ID_HEADER: &str = "x-typesafe-request-id";
 /// Backoff when a retryable response carries no hint.
 pub const DEFAULT_BACKOFF: Duration = Duration::from_millis(500);
@@ -127,10 +130,21 @@ pub fn resolve_key(
 pub struct Transport {
     /// Base URL (no trailing slash needed).
     pub base_url: String,
+    /// Endpoint path, starting with `/` (`judge.path`, D28; `config`
+    /// validates it).
+    pub path: String,
     /// Per-attempt timeout.
     pub timeout: Duration,
     /// Total budget.
     pub budget: Duration,
+}
+
+impl Transport {
+    /// The request URL: the base URL (trailing slashes dropped) plus the
+    /// path.
+    pub fn url(&self) -> String {
+        format!("{}{}", self.base_url.trim_end_matches('/'), self.path)
+    }
 }
 
 /// A successful exchange.
@@ -248,7 +262,7 @@ fn snippet(s: &str) -> String {
 /// sends no `Authorization` header (D23, `api_key_required = false`).
 pub fn post(t: &Transport, key: Option<&Secret>, body: &str) -> Result<Reply, Failure> {
     let start = Instant::now();
-    let url = format!("{}/v1/systemone", t.base_url.trim_end_matches('/'));
+    let url = t.url();
     let mut attempts = 0u32;
     let fail = |error: String, request_id: Option<String>, attempts: u32| Failure {
         error: redact(&error, key),
@@ -397,6 +411,28 @@ mod tests {
             "local.host:9"
         );
         assert_eq!(host_of("localhost:7"), "localhost:7");
+    }
+
+    #[test]
+    fn transport_url_joins_base_and_path() {
+        let t = |base: &str, path: &str| Transport {
+            base_url: base.into(),
+            path: path.into(),
+            timeout: Duration::from_secs(1),
+            budget: Duration::from_secs(1),
+        };
+        assert_eq!(
+            t("https://api.typesafe.ai", "/v1/systemone").url(),
+            "https://api.typesafe.ai/v1/systemone"
+        );
+        assert_eq!(
+            t("https://openrouter.ai/", "/api/alpha/decisions").url(),
+            "https://openrouter.ai/api/alpha/decisions"
+        );
+        assert_eq!(
+            t("http://127.0.0.1:8090//", "/v1/systemone").url(),
+            "http://127.0.0.1:8090/v1/systemone"
+        );
     }
 
     #[test]

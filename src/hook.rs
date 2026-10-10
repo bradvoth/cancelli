@@ -141,6 +141,7 @@ fn judge_error_record(
         extra.insert("request_id".into(), json!(j.request_id));
         extra.insert("attempts".into(), json!(j.attempts));
         extra.insert("backend_host".into(), json!(j.backend_host));
+        extra.insert("backend_path".into(), json!(j.backend_path));
     }
     Some(error_record(loaded, "judge", e, extra))
 }
@@ -154,6 +155,7 @@ pub fn jev_settings(c: &Config) -> jev::Settings {
     jev::Settings {
         transport: Transport {
             base_url: c.judge_base_url.clone(),
+            path: c.judge_path.clone(),
             timeout: Duration::from_millis(c.judge_timeout_ms),
             budget: Duration::from_millis(c.judge_budget_ms),
         },

@@ -34,8 +34,9 @@ use crate::jev::calibration::{
     self, AxisCal, CalibrationFile, FORMAT, Method, Metrics, ScalarPair, VecPair, brier, ece,
     fit_platt, fit_temperature, platt, temper,
 };
-use crate::jev::client::{self, DEFAULT_EXPECTED_MODEL};
+use crate::jev::client;
 use crate::jev::decide::{Answers, WireAnswer};
+use crate::jev::provider;
 use crate::jev::rubric::{Primitive, Rubric};
 use crate::jev::{self, request_body};
 use crate::logging;
@@ -150,8 +151,9 @@ fn item_of(v: &Value, rubric_hash: &str, n: usize) -> Result<Item, String> {
     } else {
         return Err("not a pair, tte row or cancelli judge record".into());
     };
-    if model.and_then(Value::as_str) != Some(DEFAULT_EXPECTED_MODEL) {
-        return Err(format!("reference is not {DEFAULT_EXPECTED_MODEL}"));
+    // A stable reason: it is a count key in the summary.
+    if !model.and_then(Value::as_str).is_some_and(provider::is_jev) {
+        return Err("reference is not Jev".into());
     }
     rh(rhash)?;
     let raw = answers.filter(|a| a.is_object()).ok_or("no answers")?;
@@ -334,9 +336,9 @@ pub fn run(args: &CalibrateArgs, env: &Env) -> Result<Outcome, String> {
         items.retain(|i| i.target.is_some());
     } else if needs > 0 {
         let expected = &c.tunables.judge.expected_model;
-        if expected == DEFAULT_EXPECTED_MODEL {
+        if provider::is_jev(expected) {
             return Err(format!(
-                "judge.expected_model is {DEFAULT_EXPECTED_MODEL:?}: calibrate fits another \
+                "judge.expected_model is {expected:?}, Jev itself: calibrate fits another \
                  /v1/systemone backend against Jev; point [judge] base_url/expected_model at it \
                  (or use --offline with pair files)"
             ));

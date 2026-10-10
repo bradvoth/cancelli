@@ -155,7 +155,9 @@ impl Env {
             .env("CANCELLI_LOG_DIR", &self.logs)
             .env_remove("CANCELLI_MODE")
             .env_remove("TYPESAFE_BASE_URL")
-            .env_remove("TYPESAFE_API_KEY");
+            .env_remove("TYPESAFE_API_KEY")
+            .env_remove("OPENROUTER_BASE_URL")
+            .env_remove("OPENROUTER_API_KEY");
         for v in [
             "ALL_PROXY",
             "all_proxy",

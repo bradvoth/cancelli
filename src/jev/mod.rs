@@ -1,5 +1,6 @@
 //! Jev as the WARN adjudicator (D11–D17): `jev-1.13.0`, TypeSafe AI's
-//! hosted "System One" API, or since D23 any `/v1/systemone`-compatible
+//! hosted "System One" API, the same model through OpenRouter's Decisions
+//! API ([`provider`], D28), or since D23 any `/v1/systemone`-compatible
 //! server (e.g. jev-rs on a local model), with optional per-axis
 //! calibration of its answers (D24).
 //!
@@ -9,7 +10,7 @@
 //!
 //! Pipeline for one unresolved CARE WARN: transcript -> [`transcript::Context`]
 //! (level L2/L1/L0) -> [`state::State`] (the POC's render template, D16) ->
-//! one `POST /v1/systemone` with the rubric's questions for that level ->
+//! one `POST {base_url}{path}` with the rubric's questions for that level ->
 //! [`evaluate`]: model check (`judge.expected_model`) -> completeness ->
 //! calibration (`judge.calibration_file`) -> [`decide::signals`] ->
 //! [`decide::tier`] -> verdict (D14). Every failure is `ask` plus an error
@@ -20,6 +21,7 @@
 pub mod calibration;
 pub mod client;
 pub mod decide;
+pub mod provider;
 pub mod pyjson;
 pub mod rubric;
 pub mod state;
@@ -87,6 +89,8 @@ pub struct JudgeRecord {
     pub backend: &'static str,
     /// D23: `host[:port]` of `judge.base_url`.
     pub backend_host: String,
+    /// D28: `judge.path`, the endpoint hit on that host.
+    pub backend_path: String,
     /// D23: the `response.model` required (`judge.expected_model`).
     pub expected_model: String,
     /// Achieved context level.
@@ -263,6 +267,7 @@ pub fn new_record(
     JudgeRecord {
         backend: "jev",
         backend_host: client::host_of(&s.transport.base_url),
+        backend_path: s.transport.path.clone(),
         expected_model: s.expected_model.clone(),
         level: ctx.level,
         context: ctx,
@@ -424,7 +429,7 @@ pub fn evaluate(
 ) -> Result<(), String> {
     rec.model = Some(model.to_string());
     rec.answers = Some(answers_raw);
-    if model != s.expected_model {
+    if !model_matches(&s.expected_model, model) {
         return Err(format!(
             "response.model {model:?} != expected_model {:?}",
             s.expected_model
@@ -491,4 +496,44 @@ impl Adjudicator for JevAdjudicator {
 /// for reading the transcript.
 pub fn backstop(budget: Duration) -> Duration {
     budget + Duration::from_millis(1500)
+}
+
+/// D23/D28: does a reported `response.model` satisfy `judge.expected_model`?
+/// Exact, unless `expected` ends in `*` (the only wildcard): then any name
+/// with that prefix. `typesafe/jev-1.13-*` accepts every dated OpenRouter
+/// snapshot of Jev 1.13 and refuses any other listing; `jev-1.13.0` stays an
+/// exact pin. The loader refuses a bare `*` (an empty prefix), so no
+/// configured value accepts every model.
+pub fn model_matches(expected: &str, reported: &str) -> bool {
+    match expected.strip_suffix('*') {
+        Some(prefix) => reported.starts_with(prefix),
+        None => reported == expected,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_matches;
+
+    #[test]
+    fn expected_model_is_exact_unless_it_ends_in_a_star() {
+        assert!(model_matches("jev-1.13.0", "jev-1.13.0"));
+        assert!(!model_matches("jev-1.13.0", "jev-1.13.1"));
+        assert!(!model_matches("jev-1.13.0", "jev-1.13.0-rc1"));
+        assert!(model_matches(
+            "typesafe/jev-1.13-*",
+            "typesafe/jev-1.13-20260917"
+        ));
+        assert!(model_matches(
+            "typesafe/jev-1.13-*",
+            "typesafe/jev-1.13-20991231"
+        ));
+        assert!(!model_matches(
+            "typesafe/jev-1.13-*",
+            "typesafe/jev-1.14-20991231"
+        ));
+        assert!(!model_matches("typesafe/jev-1.13-*", "typesafe/jev-1.13"));
+        // total as a function; `tunables` refuses a bare `*`
+        assert!(model_matches("*", "anything"));
+    }
 }

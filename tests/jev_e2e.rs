@@ -263,6 +263,8 @@ fn run(s: &Setup) -> Run {
         .env_remove("XDG_CONFIG_HOME")
         .env_remove("CANCELLI_MODE")
         .env_remove("TYPESAFE_BASE_URL")
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("OPENROUTER_BASE_URL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

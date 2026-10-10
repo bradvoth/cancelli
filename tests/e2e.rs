@@ -30,6 +30,8 @@ fn run_in(args: &[&str], stdin: &str, home: &std::path::Path, logdir: &std::path
         // Never reach the network: with no key, Jev fails before connecting.
         .env_remove("TYPESAFE_API_KEY")
         .env_remove("TYPESAFE_BASE_URL")
+        .env_remove("OPENROUTER_API_KEY")
+        .env_remove("OPENROUTER_BASE_URL")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -445,6 +447,7 @@ fn non_utf8_environment_does_not_break_the_hook() {
         .env("HOME", home.path())
         .env("CANCELLI_LOG_DIR", logdir.path())
         .env_remove("TYPESAFE_API_KEY")
+        .env_remove("OPENROUTER_API_KEY")
         .env(
             "CANCELLI_TEST_BAD",
             std::ffi::OsStr::from_bytes(b"\xff\xfe"),

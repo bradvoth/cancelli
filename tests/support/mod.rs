@@ -1,8 +1,11 @@
-//! A local `/v1/systemone` replay server (the tests/jev_e2e.rs pattern) and
-//! helpers shared by the D23–D25 end-to-end tests. It replays the POC's real
+//! A local replay server (the tests/jev_e2e.rs pattern) answering on any
+//! path, and helpers shared by the D23–D25 and D28 end-to-end tests. It replays the POC's real
 //! cached `jev-1.13.0` answers (tests/fixtures/jev) under any reported
 //! model name, so a "local backend" can be exercised offline. It binds
 //! 127.0.0.1:0 (an ephemeral port).
+
+// Each test binary compiles this module and uses a subset of it.
+#![allow(dead_code)]
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -21,6 +24,8 @@ pub const KEY: &str = "tsk_test_DO_NOT_LOG_d23d25";
 /// One HTTP request as received.
 #[derive(Debug, Clone)]
 pub struct Captured {
+    /// `POST /v1/systemone HTTP/1.1`.
+    pub request_line: String,
     /// Lower-cased header names and values.
     pub headers: Vec<(String, String)>,
     /// Body.
@@ -94,6 +99,7 @@ fn read_request(s: &mut TcpStream) -> Option<Captured> {
     let mut body = vec![0; len];
     r.read_exact(&mut body).ok()?;
     Some(Captured {
+        request_line: request_line.trim_end().to_string(),
         headers,
         body: String::from_utf8_lossy(&body).into_owned(),
     })
@@ -142,6 +148,8 @@ pub fn bin() -> Command {
         "CANCELLI_MODE",
         "TYPESAFE_BASE_URL",
         "TYPESAFE_API_KEY",
+        "OPENROUTER_BASE_URL",
+        "OPENROUTER_API_KEY",
     ] {
         c.env_remove(v);
     }

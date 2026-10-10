@@ -10,8 +10,9 @@ guard *would* decide before turning enforcement on.
 
 For now it runs in **dry-run**: it always allows the command and only logs.
 Borderline (WARN) commands are adjudicated by **Jev** (`jev-1.13.0`, TypeSafe
-AI's hosted model; decisions D11–D17), which sees the user's request and the
-agent's prior tool calls. Every tool call CARE cannot score (`Write`, `Edit`,
+AI's hosted model, reached directly or through OpenRouter's Decisions API,
+D28; decisions D11–D17), which sees the user's request and the agent's prior
+tool calls. Every tool call CARE cannot score (`Write`, `Edit`,
 `Read`, `WebFetch`, `mcp__…`, or a `Bash` call without a command) is treated
 as a WARN and also goes to Jev (D21), unless its tool is listed in
 `[jev] skip_tools`. See [Jev adjudicator](#jev-adjudicator), including
@@ -75,6 +76,7 @@ cargo build --release
 cargo test                       # unit + e2e + parity + Jev offline + docs consistency
 cargo test --test install -- --ignored   # cargo-install smoke test (slow)
 TYPESAFE_API_KEY=... cargo test --test jev_live -- --ignored   # live Jev API (see below)
+OPENROUTER_API_KEY=... cargo test --test openrouter_live -- --ignored   # the same, through OpenRouter (D28)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
@@ -167,10 +169,13 @@ max_field_bytes = 4096            # non-Bash string truncation threshold
 
 [judge]
 backend = "jev"            # "jev" | "stub"
-base_url = "https://api.typesafe.ai"   # env TYPESAFE_BASE_URL overrides
-model = "jev-1.13.0"       # requested model (sent in the request body)
-# expected_model = "jev-1.13.0"   # D23: response.model must equal this, else ask (D15); set it for another /v1/systemone server
-api_key_env = "TYPESAFE_API_KEY"
+# provider = "typesafe"    # D28: "typesafe" (api.typesafe.ai, the default) | "openrouter" (OpenRouter's Decisions API, the same Jev model).
+#                          # It sets the defaults of base_url, path, model, expected_model and api_key_env; a key set here still wins.
+# base_url = "https://api.typesafe.ai"   # provider default (openrouter: https://openrouter.ai); env TYPESAFE_BASE_URL / OPENROUTER_BASE_URL overrides
+# path = "/v1/systemone"                 # provider default (openrouter: /api/alpha/decisions)
+# model = "jev-1.13.0"                   # requested model, sent in the request body; provider default (openrouter: typesafe/jev-1.13)
+# expected_model = "jev-1.13.0"   # D23: response.model must match this, else ask (D15); exact, or a prefix with one trailing * (D28); provider default (openrouter: typesafe/jev-1.13-*); set it for another /v1/systemone server
+# api_key_env = "TYPESAFE_API_KEY"       # provider default (openrouter: OPENROUTER_API_KEY)
 # api_key_file = "~/.config/cancelli/jev_api_key"   # 0600; used if the env var is unset (this path is the default when the file exists)
 api_key_required = true    # D23: false for local servers: no key needed, no Authorization header when none is found
 timeout_ms = 3000          # per request
@@ -386,7 +391,7 @@ writes the same list as comments):
 | `jev.context.field_chars` | `4000` | clip for args, the user request and each prior call (characters) | POC jev_gate/prepare.py; jev-integration-spec §3.3 |
 | `jev.context.history_chars` | `12000` | history budget for prior calls, newest kept first (characters) | POC jev_gate/prepare.py; jev-integration-spec §3.3 |
 | `jev.context.max_level` | `"L2"` | highest context level: L0 action, L1 +user request, L2 +prior calls | D16; POC jev_gate/context.py |
-| `judge.expected_model` | `"jev-1.13.0"` | response.model the /v1/systemone backend must report; anything else asks (D15) | D23 |
+| `judge.expected_model` | `"jev-1.13.0"` | response.model the backend must report, exactly or as a non-empty prefix ending in `*`; the provider's Jev name by default (openrouter: `"typesafe/jev-1.13-*"`, D28); anything else asks (D15) | D23 |
 | `judge.calibration_file` | (none) | per-axis calibration (JSON) pinned to rubric_hash + model; invalid or mismatched asks (fingerprinted by the file's sha256) | D24 |
 | `care.rules."SE-P-NNN".enabled` | `true` | `false` removes the rule from L4 matching and from p_rule | D18 |
 | `care.rules."SE-P-NNN".confidence` | the bank's value (`SE-P-003`: `0.75`, D27) | replaces the rule's confidence in L4 (π·conf) and in p_rule | data/rule_provenance.json (care/rules/rule_provenance.json) |
@@ -503,7 +508,7 @@ judge `error` record for such a call also carries `tool_name` and
 For a WARN that reaches Jev (CARE's, or a D21 unscorable call), `judge` is
 the full Jev record (D17):
 `backend`, `backend_host` (D23: `host[:port]` of `judge.base_url`),
-`expected_model` (D23), `decision`, `level` (`l2_actions` | `l1_request` | `l0_action`),
+`backend_path` (D28: `judge.path`), `expected_model` (D23), `decision`, `level` (`l2_actions` | `l1_request` | `l0_action`),
 `context{level_reason, prompts_total, prompts_kept, actions_total,
 bad_lines}`, `questions_sent[]`, `state` (the exact text sent),
 `state_hash`, `rubric_hash`, `model` (the backend's reported model),
@@ -512,9 +517,10 @@ sha, rubric_hash, model, fitted_at, axes[]}` (D24, only with a calibration
 file), `signals` (read from the calibrated answers when there are any),
 `tier` (`T1`…`T6`), `tier_rule`, `verdict`, `would_emit`, `latency_ms`,
 `usage`, `request_id`, `attempts`, `key_source` (e.g. `env
-$TYPESAFE_API_KEY`, or `none (judge.api_key_required = false)`, never the
-key), `error`. A Jev failure also writes a separate `error` record with
-`stage: "judge"` (and `backend_host`).
+$TYPESAFE_API_KEY`, `env $OPENROUTER_API_KEY` under the `openrouter`
+provider, or `none (judge.api_key_required = false)`, never the key),
+`error`. A Jev failure also writes a separate `error` record with
+`stage: "judge"` (and `backend_host`, `backend_path`).
 
 ### Examining the data
 
@@ -589,8 +595,9 @@ call.
 For each unresolved Bash WARN, and for **every tool call CARE cannot score
 whose tool is not in `[jev] skip_tools`** (D21; the default list is empty,
 so by default that is every non-Bash call), cancelli sends one HTTPS `POST`
-to `{base_url}/v1/systemone` (default **api.typesafe.ai**). The request
-holds:
+to `{base_url}{path}` (default **api.typesafe.ai** `/v1/systemone`; with
+the `openrouter` provider, **openrouter.ai** `/api/alpha/decisions`, D28).
+The request holds:
 
 - **the proposed action**: the Bash command, or, for any other tool, its
   **full `tool_input` verbatim** as JSON (clipped at 4,000 characters,
@@ -618,7 +625,8 @@ egress.
 ### Key setup
 
 The key is read from the env var named by `judge.api_key_env` (default
-`TYPESAFE_API_KEY`), otherwise from `judge.api_key_file`. The file is
+`TYPESAFE_API_KEY`; `OPENROUTER_API_KEY` under the `openrouter` provider,
+D28), otherwise from `judge.api_key_file`. The file is
 **refused** if it has any group or other permission bit (it must be `0600` or
 stricter). The key is never logged, never written to `config.toml`, redacted
 from error strings, and `cancelli config` only reports where it was found.
@@ -634,6 +642,50 @@ cancelli config | grep 'api key'            # -> found (file …)
 is inherited by every command the agent runs, so the agent can read it.
 The POC avoided exporting its key for the same reason. Without a key, every
 unresolved WARN is a Jev failure (`ask`), and no request is made.
+
+### Jev through OpenRouter (D28)
+
+OpenRouter hosts the same Jev model on its Decisions API
+(`POST https://openrouter.ai/api/alpha/decisions`, model `typesafe/jev-1.13`,
+reported under a dated snapshot slug such as `typesafe/jev-1.13-20260917`;
+same request and response shape
+as `/v1/systemone`, $0.042 per million input tokens). `[judge] provider`
+selects it:
+
+```toml
+[judge]
+provider = "openrouter"    # base_url, path, model, expected_model and api_key_env default to OpenRouter's
+# api_key_file = "~/.config/cancelli/jev_api_key"   # an OpenRouter key works here too (0600)
+```
+
+- **Defaults only.** The provider sets the defaults of `base_url`
+  (`https://openrouter.ai`), `path` (`/api/alpha/decisions`), `model`
+  (`typesafe/jev-1.13`), `expected_model` (`typesafe/jev-1.13-*`) and
+  `api_key_env` (`OPENROUTER_API_KEY`). Any of them set in the file still
+  wins, and `OPENROUTER_BASE_URL` overrides the base URL as
+  `TYPESAFE_BASE_URL` does for TypeSafe.
+- **The file decides.** `provider` is read from the config file only. An
+  exported `OPENROUTER_API_KEY` by itself changes nothing: without
+  `provider = "openrouter"` the judge is TypeSafe, `TYPESAFE_API_KEY` is the
+  variable looked up, and `OPENROUTER_BASE_URL` is not read. So an existing
+  TypeSafe or local-backend setup cannot change because of the environment.
+  `cancelli config` shows `judge.provider` with its source.
+- **Same model, same thresholds.** The tier thresholds and the rubric were
+  measured on Jev, and OpenRouter forwards every request to TypeSafe, so no
+  calibration file is involved. One predicate (`provider::is_jev`) answers
+  "is this Jev?" for both names: `cancelli calibrate` refuses either as a
+  target and accepts references from either, the "calibrated on
+  `jev-1.13.0`" warning stays quiet, and `cancelli eval` reuses logged
+  answers across the two providers. Every judge record logs `backend_path`
+  next to `backend_host`.
+- **Snapshots, not brittleness.** OpenRouter re-dates the slug when TypeSafe
+  redeploys 1.13, so the default `expected_model` is `typesafe/jev-1.13-*`:
+  a value ending in `*` (the only wildcard: once, at the end, after a
+  non-empty prefix) is a prefix match. A new snapshot keeps working; another listing such as
+  `typesafe/jev-1.14-…` is refused with a `response.model … != expected_model
+  …` error (D15). Every judge record still logs the exact reported `model`,
+  so a snapshot change is visible in the logs. TypeSafe's own default stays
+  the exact pin `jev-1.13.0`.
 
 ### How a Claude Code call is mapped (D16)
 
@@ -739,7 +791,8 @@ connection error, a timeout, a non-2xx response, an unparseable body, a
 missing, wrongly typed or malformed answer for any question sent (a noul or
 score reading that is not finite; choice probabilities that are not finite,
 are negative, or do not sum to 1 within 0.05),
-`response.model != judge.expected_model` (default `"jev-1.13.0"`, D23), and
+`response.model != judge.expected_model` (default `"jev-1.13.0"`, D23; a
+prefix match when it ends in `*`, D28), and
 a configured calibration file that is unreadable, invalid or pinned to
 another rubric or model (D24). Timing: `timeout_ms` (3,000) per request
 and `budget_ms` (5,000) in total. There is at most **one retry**, only on
@@ -786,14 +839,23 @@ the POC never ran against Claude Code transcripts.
 
 ```sh
 TYPESAFE_API_KEY=... cargo test --test jev_live -- --ignored --test-threads=1
+OPENROUTER_API_KEY=... cargo test --test openrouter_live -- --ignored --test-threads=1
 ```
 
 `tests/jev_live.rs` runs the POC's smoke gate against the real API (4 pairs,
 10 checks, deny-side strictly greater, `response.model` asserted) and sends
 one WARN command end to end through a `cargo install`ed binary with a
-transcript. The installed-binary test does a release build. Both tests fail
-immediately, with instructions, when `TYPESAFE_API_KEY` is unset. They honour
-`TYPESAFE_BASE_URL`.
+transcript and a config file naming the provider. The installed-binary test
+does a release build. Both tests fail immediately, with instructions, when
+`TYPESAFE_API_KEY` is unset. They honour `TYPESAFE_BASE_URL`.
+`tests/openrouter_live.rs` runs the same two tests (shared in
+`tests/common/live.rs`) through OpenRouter (D28): `OPENROUTER_API_KEY`,
+`OPENROUTER_BASE_URL`, the decisions path, and a `typesafe/jev-1.13-*`
+snapshot asserted as `response.model`. OpenRouter reports `usage` in
+TypeSafe's shape (asserted) and sends no request id, so `request_id` is
+null (printed, not asserted); both verified live on 2026-10-10.
+`tests/openrouter_e2e.rs` covers the `openrouter` provider offline, against
+the replay server.
 
 ### HTTP client choice
 
@@ -816,7 +878,7 @@ would need its CA added some other way.
 The judge is not tied to TypeSafe's hosted API: `backend = "jev"` means
 **any server that speaks `POST /v1/systemone`** (request `{state, model,
 questions}`, response `{model, answers, usage?}` with `noul` / `score` /
-`choice` answers). The name stays `jev`; there is no alias. The hook never
+`choice` answers; `judge.path` changes the path, D28). The name stays `jev`; there is no alias. The hook never
 runs inference itself (a hook is a fresh process per tool call); the model
 lives in a long-running server such as
 [jev-rs](docs/research/local-jev-serving.md) on top of llama-server.
@@ -834,7 +896,8 @@ calibration_file = "~/.config/cancelli/qwen3-4b.calibration.json"   # D24, below
 
 - `expected_model` (default `"jev-1.13.0"`) replaces the hard-coded pin: a
   response reporting any other model is a D15 failure (**ask** plus an error
-  record). Set it to exactly what the server reports.
+  record). Set it to what the server reports, or to a prefix ending in `*`
+  (D28).
 - `api_key_required = false`: a missing key is fine and no `Authorization`
   header is sent. A key that *is* found (env var or key file) is still sent.
 - Every judge record logs the backend identity: `backend_host` (`host:port`
@@ -907,9 +970,11 @@ Jev `answers`, `rubric_hash`, `model`), a **cancelli log record** whose
 fits on). Rows and records are deduplicated by state; their states are sent
 to the configured backend with exactly the questions Jev answered, and its
 raw (uncalibrated) answers are the target. Rows from another rubric, and
-references that are not `jev-1.13.0`, are skipped and counted. The command
-refuses to run online while `expected_model` is `jev-1.13.0` (calibrating
-Jev against itself would only spend API calls).
+references not answered by Jev (`jev-1.13.0`, or OpenRouter's dated
+`typesafe/jev-1.13-…` slug, D28), are skipped and counted. The command
+refuses to run online while `expected_model` is Jev's own name under either
+provider (`jev-1.13.0`, or OpenRouter's `typesafe/jev-1.13-*`, D28):
+calibrating Jev against itself would only spend API calls.
 
 Fitting: Platt `(a, b)` minimises the cross-entropy against Jev's `p` as a
 soft target (Newton's method); the temperature minimises `Σ KL(q_jev ‖
@@ -937,7 +1002,8 @@ duplicated), under the given config (environment overrides such as
 - **CARE** is replayed exactly, from the logged `command`.
 - **Judge.** When the would-be state and the rubric are unchanged and the
   effective backend (`base_url` host + `expected_model`) is the one the
-  record was judged with, the **logged answers are reused** and evaluated
+  record was judged with, or both are Jev under either provider (D28), the
+  **logged answers are reused** and evaluated
   under the new config (calibration, thresholds, tier order, verdicts).
   Otherwise the configured backend is queried: the **logged state is
   resent** when the record has one; a call that **newly reaches** the judge

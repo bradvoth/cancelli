@@ -421,6 +421,23 @@ fn a_different_backend_gets_the_logged_states_resent() {
 }
 
 #[test]
+fn the_other_provider_reuses_the_logged_jev_answers() {
+    // D28: the fixture was judged by "jev-1.13.0" at the replay server.
+    // Under `provider = "openrouter"` (another host, expected_model
+    // typesafe/jev-1.13-*) the model is still Jev, so --offline reuses
+    // every logged answer instead of reporting "needs judge".
+    let f = fixture();
+    let cfg = f.config(
+        "openrouter.toml",
+        &format!("{PAPER_BAND}{PAPER_H_SEM}[judge]\nprovider = \"openrouter\"\n"),
+    );
+    let (by, _) = f.eval_json(&cfg, true);
+    for id in ["toolu_warn", "toolu_read", "toolu_write"] {
+        assert_eq!(by[id]["judge"]["kind"], "reused", "{id}: {}", why(&by[id]));
+    }
+}
+
+#[test]
 fn same_config_replays_to_no_changes() {
     let f = fixture();
     // exactly the generation config, as a file

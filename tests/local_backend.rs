@@ -603,7 +603,7 @@ fn calibrate_queries_the_backend_for_reference_rows_and_logs() {
     assert!(stdout.contains("13 pairs, 13 backend queries"), "{stdout}");
     assert!(stdout.contains("skipped 1: duplicate state"), "{stdout}");
     assert!(
-        stdout.contains("skipped 1: reference is not jev-1.13.0"),
+        stdout.contains("skipped 1: reference is not Jev"),
         "{stdout}"
     );
     let reqs = srv.requests();
